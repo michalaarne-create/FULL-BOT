@@ -38,7 +38,14 @@ class LiveRecorder(LiveRecorderCaptureMixin, LiveRecorderBrowserMixin, LiveRecor
 async def main():
     import argparse
     parser = argparse.ArgumentParser(description="AI Recorder Live - STEALTH CDP connect (clean)")
-    parser.add_argument("--output", type=str, default=str(Path.cwd() / "dom_live"))
+    parser.add_argument(
+        "--output",
+        "--output-dir",
+        dest="output",
+        type=str,
+        default=str(Path.cwd() / "dom_live"),
+        help="Directory used for recorder output (alias: --output-dir)",
+    )
     parser.add_argument("--user-data-dir", type=str, default=str(Path.cwd() / "_recorder_profile"))
     parser.add_argument(
         "--profile-dir",
@@ -56,6 +63,12 @@ async def main():
     )
     parser.add_argument("--url", type=str, default=START_URL_DEFAULT)
     parser.add_argument("--fps", type=float, default=SNAPSHOT_FPS_DEFAULT)
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        default=None,
+        help="Optional log file path (defaults to <output>/recorder_debug.log)",
+    )
     screenshot_group = parser.add_mutually_exclusive_group()
     screenshot_group.add_argument(
         "--screenshots",
@@ -124,7 +137,8 @@ async def main():
     ensure_dir(out_abs)
     ensure_dir(ud_abs)
 
-    set_log_file(out_abs / "recorder_debug.log")
+    log_path = Path(args.log_file).expanduser().resolve() if args.log_file else out_abs / "recorder_debug.log"
+    set_log_file(log_path)
     set_verbose_debug(bool(args.verbose))
     log(f"ENV: Python={sys.version.split()[0]} | Platform={sys.platform}", "DEBUG")
 

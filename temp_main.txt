@@ -1,0 +1,197 @@
+    ry_max = min(screen_h - 5, y2 - 5)
+    if rx_max <= rx_min or ry_max <= ry_min:
+        log("[WARN] No space to place random click inside bbox.")
+        update_overlay_status("No space for random click.")
+        return
+    rand_x = random.randint(rx_min, rx_max)
+    rand_y = random.randint(ry_min, ry_max)
+    move_payload = {"cmd": "move", "x": rand_x, "y": rand_y}
+    if _send_control_agent(move_payload, CONTROL_AGENT_PORT):
+        cancel_hover_fallback_timer()
+        log(f"[INFO] Random click sent at ({rand_x}, {rand_y}) from {summary_path.name}")
+        update_overlay_status(f"Random click at ({rand_x}, {rand_y})")
+    else:
+        update_overlay_status("Failed to send random click.")
+
+
+def start_ai_recorder(extra_args: Optional[Iterable[str]] = None) -> Optional[subprocess.Popen]:
+    """Launch ai_recorder_live.py in the background."""
+    if not AI_RECORDER_SCRIPT.exists():
+        log(f"[WARN] ai_recorder_live not found at {AI_RECORDER_SCRIPT}")
+        return None
+
+    args = [sys.executable, str(AI_RECORDER_SCRIPT)]
+    if extra_args:
+        args.extend(extra_args)
+
+    log(f"[INFO] Launching ai_recorder_live ({' '.join(args[2:]) or 'default args'})")
+    return subprocess.Popen(args, cwd=str(ROOT), **SUBPROCESS_KW)
+
+
+def stop_process(proc: Optional[subprocess.Popen], timeout: float = 5.0) -> None:
+    """Terminate a subprocess politely and fall back to kill if needed."""
+    if proc is None:
+        return
+    if proc.poll() is not None:
+        return
+
+    log("[INFO] Stopping ai_recorder_live...")
+    proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        log("[WARN] ai_recorder_live did not stop in time; killing.")
+        proc.kill()
+
+
+def pipeline_iteration(loop_idx: int, screenshot_prefix: str = "screen") -> None:
+    name = f"{screenshot_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
+    screenshot_path = SCREENSHOT_DIR / name
+    capture_fullscreen(screenshot_path)
+    log(f"[INFO] Saved screenshot -> {screenshot_path}")
+    update_overlay_status(f"Screenshot captured ({screenshot_path.name})")
+
+    hover_task: Optional[Tuple[subprocess.Popen, Path]] = None
+    hover_input = prepare_hover_image(screenshot_path)
+    if hover_input:
+        hover_task = run_hover_bot(hover_input, screenshot_path.stem)
+
+    update_overlay_status("Running region_grow...")
+    json_path = run_region_grow(screenshot_path)
+    if not json_path:
+        update_overlay_status("region_grow failed.")
+        return
+    update_overlay_status("region_grow done. Running rating...")
+    run_arrow_post(json_path)
+    if run_rating(json_path):
+        summary_path = RATE_SUMMARY_DIR / f"{screenshot_path.stem}_summary.json"
+        send_random_click(summary_path, screenshot_path)
+        update_overlay_status("rating completed.")
+    else:
+        update_overlay_status("rating failed.")
+    if hover_task:
+        finalize_hover_bot(hover_task)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Launch ai_recorder_live and run OCR -> region_grow -> rating every few seconds.",
+    )
+    parser.add_argument("--interval", type=float, default=3.0, help="Delay between pipeline iterations.")
+    parser.add_argument(
+        "--loop-count",
+        type=int,
+        default=None,
+        help="Number of iterations to run (default: infinite). Useful for testing.",
+    )
+    parser.add_argument(
+        "--disable-recorder",
+        action="store_true",
+        help="Do not spawn ai_recorder_live.py (keeps only the pipeline).",
+    )
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        help="Run pipeline continuously without waiting for hotkey.",
+    )
+    parser.add_argument(
+        "--recorder-args",
+        nargs=argparse.REMAINDER,
+        default=None,
+        help="Additional args passed to ai_recorder_live.py. Use as: --recorder-args -- --url https://example.com",
+    )
+    return parser.parse_args()
+
+
+def start_hotkey_listener(event: threading.Event) -> Optional["keyboard.Listener"]:
+    try:
+        from pynput import keyboard  # type: ignore
+    except Exception as exc:
+        log(f"[WARN] Hotkey listener unavailable (pynput import failed: {exc}). Falling back to auto mode.")
+        return None
+
+    def on_press(key):
+        try:
+            if key.char and key.char.lower() == "p":
+                log("[INFO] Hotkey 'P' pressed — starting pipeline.")
+                event.set()
+                update_overlay_status("Hotkey 'P' pressed — pipeline starting.")
+        except AttributeError:
+            pass
+
+    listener = keyboard.Listener(on_press=on_press)
+    listener.daemon = True
+    listener.start()
+    log("[INFO] Hotkey listener active — press 'P' to start pipeline iteration.")
+    update_overlay_status("Ready. Press 'P' to start.")
+    return listener
+
+
+def main() -> None:
+    args = parse_args()
+    recorder_proc = None
+
+    trigger_event = threading.Event()
+    hotkey_listener = None
+    overlay = StatusOverlay()
+    overlay.start()
+    globals()["_status_overlay"] = overlay
+    update_overlay_status("Initializing pipeline...")
+
+    if not args.disable_recorder:
+        recorder_proc = start_ai_recorder(args.recorder_args)
+
+    if not args.auto:
+        hotkey_listener = start_hotkey_listener(trigger_event)
+        if hotkey_listener is None:
+            args.auto = True
+            update_overlay_status("Auto mode active.")
+    else:
+        update_overlay_status("Auto mode active.")
+
+    log(
+        f"[INFO] Pipeline start (interval={args.interval}s"
+        + (f", max_loops={args.loop_count}" if args.loop_count else ", continuous")
+        + ")"
+    )
+
+    try:
+        loop_idx = 0
+        while True:
+            loop_idx += 1
+            if not args.auto:
+                log(f"[INFO] Waiting for hotkey 'P' to start iteration #{loop_idx}...")
+                update_overlay_status(f"Waiting for 'P' (iteration {loop_idx})")
+                trigger_event.wait()
+                trigger_event.clear()
+            cancel_hover_fallback_timer()
+            log(f"[INFO] Iteration {loop_idx} start")
+            update_overlay_status(f"Iteration {loop_idx} started")
+            iter_start = time.perf_counter()
+            try:
+                pipeline_iteration(loop_idx)
+            except Exception as exc:
+                log(f"[ERROR] Pipeline iteration failed: {exc}")
+            if args.loop_count and loop_idx >= args.loop_count:
+                break
+            if args.auto:
+                elapsed = time.perf_counter() - iter_start
+                delay = max(0.0, args.interval - elapsed)
+                if delay:
+                    time.sleep(delay)
+    except KeyboardInterrupt:
+        log("[INFO] Stopped by user.")
+    finally:
+        stop_process(recorder_proc)
+        if hotkey_listener is not None:
+            try:
+                hotkey_listener.stop()
+            except Exception:
+                pass
+        cancel_hover_fallback_timer()
+        if overlay:
+            overlay.stop()
+
+
+if __name__ == "__main__":
+    main()

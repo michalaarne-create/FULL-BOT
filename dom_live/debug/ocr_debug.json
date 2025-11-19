@@ -1,7 +1,7 @@
 {
   "tab_bbox": {
-    "x_start": 1083,
-    "x_end": 1407,
+    "x_start": 926,
+    "x_end": 1250,
     "width": 1920
   },
   "crops": [
@@ -15,16 +15,10 @@
       "width": 324,
       "height": 129,
       "tokens": [
-        "wnicySzczegoly Ustugi",
-        "v 100%",
-        "67%",
-        "1%",
-        "1%",
-        "Procesor....",
-        "Pamiec",
-        "Dysk",
-        "Siec",
-        "Pro"
+        "LL BOT [Administrator]",
+        "tgpt.py",
+        "kbd scroll agent.py",
+        "chatgpt."
       ]
     },
     {
@@ -32,38 +26,31 @@
       "width": 672,
       "height": 64,
       "tokens": [
-        "from",
-        "Fut",
-        "X",
-        "Visual Studio Code (18)",
-        "60,3%",
-        "2 045,8 MB",
-        "0,1 MB/s",
-        "System",
-        "6,4%",
-        "0,1 MB",
-        "2,8 MB/s"
+        "finally:",
+        "await rec.stop()",
+        "finally:",
+        "await rec.stop()"
       ]
     }
   ],
-  "hint": "wnicySzczegoly Ustugi v 100% 67% 1% 1% Procesor.... Pamiec Dysk Siec Pro from Fut X Visual Studio Code (18) 60,3% 2 045,8 MB 0,1 MB/s System 6,4% 0,1 MB 2,8 MB/s",
-  "hint_norm": "wnicyszczegoly ustugi v 100% 67% 1% 1% procesor.... pamiec dysk siec pro from fut x visual studio code (18) 60,3% 2 045,8 mb 0,1 mb/s system 6,4% 0,1 mb 2,8 mb/s",
-  "core": "wnicyszczegoly",
+  "hint": "LL BOT [Administrator] tgpt.py kbd scroll agent.py chatgpt. finally: await rec.stop() finally: await rec.stop()",
+  "hint_norm": "ll bot [administrator] tgpt.py kbd scroll agent.py chatgpt. finally: await rec.stop() finally: await rec.stop()",
+  "core": "administrator",
   "candidates": [
     {
-      "pid": "2290353277840",
+      "pid": "1790948731856",
       "url": "https://www.google.com/",
       "title": "Google",
       "scores": {
-        "s_url": 0.07017543859649122,
-        "s_dom": 0.08,
-        "s_title": 0.04790419161676647,
+        "s_url": 0.049586776859504134,
+        "s_dom": 0.048,
+        "s_title": 0.03418803418803419,
         "url_has_core": 0.0,
         "dom_has_core": 0.0,
         "title_has_core": 0.0,
         "contains_dom": 0.0,
         "contains_brand": 0.0,
-        "total": 0.08
+        "total": 0.048
       }
     }
   ]

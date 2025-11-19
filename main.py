@@ -44,6 +44,8 @@ CONTROL_AGENT_PORT = int(os.environ.get("CONTROL_AGENT_PORT", "8765"))
 HOVER_FALLBACK_SECONDS = float(os.environ.get("HOVER_FALLBACK_SECONDS", "10"))
 RATE_SUMMARY_DIR = DATA_SCREEN_DIR / "numpy_points" / "rate_summary"
 BRAIN_STATE_FILE = ROOT / "data" / "brain_state.json"
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")
+_JSON_EXTS = (".json",)
 
 CREATE_NO_WINDOW = 0
 if os.name == "nt":
@@ -534,6 +536,157 @@ def send_random_click(summary_path: Path, image_path: Path) -> None:
         update_overlay_status("Failed to send random click.")
 
 
+def _latest_file(directory: Path, suffixes: Tuple[str, ...]) -> Optional[Path]:
+    try:
+        candidates = [
+            p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in suffixes
+        ]
+    except FileNotFoundError:
+        return None
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def run_region_grow_latest() -> Optional[Path]:
+    latest = _latest_file(SCREENSHOT_DIR, _IMAGE_EXTS)
+    if latest is None:
+        log("[WARN] No screenshots available for manual region_grow.")
+        update_overlay_status("No screenshots for region_grow.")
+        return None
+    update_overlay_status(f"Manual region_grow on {latest.name}")
+    json_path = run_region_grow(latest)
+    if json_path:
+        run_arrow_post(json_path)
+        update_overlay_status(f"region_grow completed ({json_path.name})")
+    else:
+        update_overlay_status("region_grow failed.")
+    return json_path
+
+
+def run_rating_latest() -> bool:
+    latest = _latest_file(SCREEN_BOXES_DIR, _JSON_EXTS)
+    if latest is None:
+        log("[WARN] No JSON files in screen_boxes for manual rating.")
+        update_overlay_status("No JSON for rating.")
+        return False
+    update_overlay_status(f"Manual rating for {latest.name}")
+    run_arrow_post(latest)
+    ok = run_rating(latest)
+    update_overlay_status("rating completed." if ok else "rating failed.")
+    return ok
+
+
+def _find_screenshot_for_summary(summary_path: Path) -> Optional[Path]:
+    stem = summary_path.stem
+    if stem.endswith("_summary"):
+        stem = stem[: -len("_summary")]
+    for ext in _IMAGE_EXTS:
+        candidate = SCREENSHOT_DIR / f"{stem}{ext}"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def send_best_click(summary_path: Path, image_path: Optional[Path]) -> None:
+    try:
+        data = json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log(f"[WARN] Could not read summary JSON {summary_path}: {exc}")
+        update_overlay_status("Summary JSON missing.")
+        return
+    top = data.get("top_labels") or {}
+    candidates = [
+        entry for entry in top.values() if isinstance(entry, dict) and entry.get("bbox")
+    ]
+    if not candidates:
+        log("[WARN] Summary has no candidates for best click.")
+        update_overlay_status("No candidates for best click.")
+        return
+    chosen = max(
+        candidates,
+        key=lambda entry: float(entry.get("score", entry.get("confidence", 0.0))),
+    )
+    bbox = chosen.get("bbox") or []
+    if not bbox or len(bbox) != 4:
+        log("[WARN] Candidate without bbox for best click.")
+        update_overlay_status("Candidate without bbox.")
+        return
+    if image_path and image_path.exists():
+        try:
+            with Image.open(image_path) as im:
+                screen_w, screen_h = im.size
+        except Exception:
+            screen_w, screen_h = (1920, 1080)
+    else:
+        screen_w, screen_h = (1920, 1080)
+    x1, y1, x2, y2 = bbox
+    x1 = max(0, int(x1))
+    y1 = max(0, int(y1))
+    x2 = min(screen_w, int(x2))
+    y2 = min(screen_h, int(y2))
+    if x2 - x1 <= 4 or y2 - y1 <= 4:
+        log("[WARN] Bounding box too small for best click.")
+        update_overlay_status("Bounding box too small.")
+        return
+    cx = int((x1 + x2) / 2)
+    cy = int((y1 + y2) / 2)
+    move_payload = {"cmd": "move", "x": cx, "y": cy}
+    if _send_control_agent(move_payload, CONTROL_AGENT_PORT):
+        update_overlay_status(f"Best click at ({cx}, {cy})")
+        log(f"[INFO] Best click sent for {summary_path.name}")
+    else:
+        update_overlay_status("Failed to send best click.")
+
+
+def trigger_best_click_from_summary() -> None:
+    summary = _latest_file(RATE_SUMMARY_DIR, _JSON_EXTS)
+    if summary is None:
+        log("[WARN] No summary JSONs available for control agent.")
+        update_overlay_status("No summary for control agent.")
+        return
+    screenshot = _find_screenshot_for_summary(summary)
+    if screenshot is None:
+        log("[WARN] Matching screenshot not found for summary, using defaults.")
+    send_best_click(summary, screenshot)
+
+
+def _handle_manual_command(
+    command: str,
+    args: argparse.Namespace,
+    recorder_proc: Optional[subprocess.Popen],
+) -> Optional[subprocess.Popen]:
+    if command == "region":
+        run_region_grow_latest()
+    elif command == "rating":
+        run_rating_latest()
+    elif command == "recorder":
+        if recorder_proc and recorder_proc.poll() is None:
+            log("[INFO] ai_recorder_live already running.")
+            update_overlay_status("Recorder already running.")
+        else:
+            recorder_proc = start_ai_recorder(args.recorder_args)
+            if recorder_proc:
+                update_overlay_status("Recorder launched.")
+    elif command == "control":
+        trigger_best_click_from_summary()
+    return recorder_proc
+
+
+def _drain_manual_commands(
+    cmd_queue: "queue.Queue[str]",
+    args: argparse.Namespace,
+    recorder_proc: Optional[subprocess.Popen],
+) -> Optional[subprocess.Popen]:
+    while True:
+        try:
+            command = cmd_queue.get_nowait()
+        except queue.Empty:
+            break
+        recorder_proc = _handle_manual_command(command, args, recorder_proc)
+    return recorder_proc
+
+
 def start_ai_recorder(extra_args: Optional[Iterable[str]] = None) -> Optional[subprocess.Popen]:
     """Launch ai_recorder_live.py in the background."""
     if not AI_RECORDER_SCRIPT.exists():
@@ -623,7 +776,9 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def start_hotkey_listener(event: threading.Event) -> Optional["keyboard.Listener"]:
+def start_hotkey_listener(
+    event: threading.Event, command_queue: "queue.Queue[str]"
+) -> Optional["keyboard.Listener"]:
     try:
         from pynput import keyboard  # type: ignore
     except Exception as exc:
@@ -632,18 +787,37 @@ def start_hotkey_listener(event: threading.Event) -> Optional["keyboard.Listener
 
     def on_press(key):
         try:
-            if key.char and key.char.lower() == "p":
+            if not key.char:
+                return
+            ch = key.char.lower()
+            if ch == "p":
                 log("[INFO] Hotkey 'P' pressed — starting pipeline.")
                 event.set()
                 update_overlay_status("Hotkey 'P' pressed — pipeline starting.")
+            elif ch == "o":
+                log("[INFO] Hotkey 'O' pressed — manual region_grow.")
+                update_overlay_status("Hotkey 'O' pressed — region_grow queued.")
+                command_queue.put("region")
+            elif ch == "l":
+                log("[INFO] Hotkey 'L' pressed — recorder launch requested.")
+                update_overlay_status("Hotkey 'L' pressed — recorder queued.")
+                command_queue.put("recorder")
+            elif ch == "i":
+                log("[INFO] Hotkey 'I' pressed — manual rating.")
+                update_overlay_status("Hotkey 'I' pressed — rating queued.")
+                command_queue.put("rating")
+            elif ch == "k":
+                log("[INFO] Hotkey 'K' pressed — control agent best click.")
+                update_overlay_status("Hotkey 'K' pressed — control agent queued.")
+                command_queue.put("control")
         except AttributeError:
             pass
 
     listener = keyboard.Listener(on_press=on_press)
     listener.daemon = True
     listener.start()
-    log("[INFO] Hotkey listener active — press 'P' to start pipeline iteration.")
-    update_overlay_status("Ready. Press 'P' to start.")
+    log("[INFO] Hotkeys: P=pipeline, O=region_grow, L=recorder, I=rating, K=control agent.")
+    update_overlay_status("Hotkeys ready (P/O/L/I/K).")
     return listener
 
 
@@ -652,6 +826,7 @@ def main() -> None:
     recorder_proc = None
 
     trigger_event = threading.Event()
+    command_queue: "queue.Queue[str]" = queue.Queue()
     hotkey_listener = None
     overlay = StatusOverlay()
     overlay.start()
@@ -662,7 +837,7 @@ def main() -> None:
         recorder_proc = start_ai_recorder(args.recorder_args)
 
     if not args.auto:
-        hotkey_listener = start_hotkey_listener(trigger_event)
+        hotkey_listener = start_hotkey_listener(trigger_event, command_queue)
         if hotkey_listener is None:
             args.auto = True
             update_overlay_status("Auto mode active.")
@@ -678,12 +853,15 @@ def main() -> None:
     try:
         loop_idx = 0
         while True:
-            loop_idx += 1
             if not args.auto:
-                log(f"[INFO] Waiting for hotkey 'P' to start iteration #{loop_idx}...")
-                update_overlay_status(f"Waiting for 'P' (iteration {loop_idx})")
-                trigger_event.wait()
+                log(f"[INFO] Waiting for hotkey 'P' to start iteration #{loop_idx + 1}...")
+                update_overlay_status(f"Waiting for 'P' (iteration {loop_idx + 1})")
+                while not trigger_event.wait(timeout=0.2):
+                    recorder_proc = _drain_manual_commands(command_queue, args, recorder_proc)
                 trigger_event.clear()
+            else:
+                recorder_proc = _drain_manual_commands(command_queue, args, recorder_proc)
+            loop_idx += 1
             cancel_hover_fallback_timer()
             log(f"[INFO] Iteration {loop_idx} start")
             update_overlay_status(f"Iteration {loop_idx} started")
@@ -692,6 +870,7 @@ def main() -> None:
                 pipeline_iteration(loop_idx)
             except Exception as exc:
                 log(f"[ERROR] Pipeline iteration failed: {exc}")
+            recorder_proc = _drain_manual_commands(command_queue, args, recorder_proc)
             if args.loop_count and loop_idx >= args.loop_count:
                 break
             if args.auto:
@@ -699,6 +878,8 @@ def main() -> None:
                 delay = max(0.0, args.interval - elapsed)
                 if delay:
                     time.sleep(delay)
+            else:
+                recorder_proc = _drain_manual_commands(command_queue, args, recorder_proc)
     except KeyboardInterrupt:
         log("[INFO] Stopped by user.")
     finally:
