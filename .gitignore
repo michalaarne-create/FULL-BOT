@@ -68,3 +68,4 @@ _recorder_profile/component_crx_cache/metadata.json
 _recorder_profile/segmentation_platform/ukm_db
 dom_live/rec.log
 dom_live/recorder_debug.log
+dom_live/debug/
