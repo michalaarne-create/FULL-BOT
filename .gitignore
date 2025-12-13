@@ -73,6 +73,11 @@ logs/
 temp/
 models/
 dom_live/recorder_debug/
+dom_live/_chrome_profile/
+tmp_cupy/
+tmp_cupy_ai/
+tmp_cupy_cp311/
+scripts/control_agent/trajectory.json
 data/**
 !data/**/
 !data/**/*_current*/
