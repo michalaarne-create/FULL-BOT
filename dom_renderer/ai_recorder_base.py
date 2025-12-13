@@ -171,15 +171,21 @@ class LiveRecorderBase:
 
         dom_only: bool = False,
 
+        extra_urls: Optional[List[str]] = None,
+
     ):
 
         self.output_dir = Path(output_dir).resolve()
 
         self.start_url = start_url
+        self.extra_urls = [u for u in (extra_urls or []) if isinstance(u, str) and u.strip()]
 
         self.user_data_dir = Path(user_data_dir).resolve()
         self.profile_directory = profile_directory
-        self.user_agent = user_agent or DEFAULT_USER_AGENT
+        ua_env = os.environ.get("RECORDER_USER_AGENT")
+        self._user_agent_custom = bool(user_agent or ua_env)
+        self.user_agent = user_agent or ua_env or None
+        self.stealth_mode = (os.environ.get("RECORDER_STEALTH_MODE", "off") or "off").lower()
         self.hardware_concurrency = os.cpu_count() or 8
         self.snapshot_interval = 1.0 / max(0.5, float(fps))
         self.goto_timeout_ms = GOTO_TIMEOUT_MS
@@ -302,7 +308,15 @@ class LiveRecorderBase:
 
         self.file_clickables = self.output_dir / "current_clickables.json"
 
-        self.file_page = self.output_dir / "current_page.json"
+        data_screen = Path(__file__).resolve().parents[1] / "data" / "screen"
+        ensure_dir(data_screen)
+        self.page_current_dir = data_screen / "page_current"
+        self.page_dir = data_screen / "page"
+        ensure_dir(self.page_current_dir)
+        ensure_dir(self.page_dir)
+        self.file_page_current = self.page_current_dir / "page_current.json"
+        self.file_page_static = self.page_dir / "page.json"
+        self.file_page = self.file_page_current
 
         self.file_stats = self.output_dir / "stats.json"
 
@@ -1290,228 +1304,114 @@ class LiveRecorderBase:
             pass
 
     async def start(self):
-
         """STEALTH START - symuluje ludzkie otwieranie strony"""
-
-        
-
-        log("đź”„ Connecting via CDP...", "INFO")
-
-        
-
-        # === LUDZKIE OPĂ“ĹąNIENIE przed connect ===
-
-        await asyncio.sleep(random.uniform(0.5, 1.5))  # 500-1500ms "myĹ›lenia"
-
-        
-
+        log("Connecting via CDP...", "INFO")
+        await asyncio.sleep(random.uniform(0.5, 1.5))
         await self._connect_cdp()
-
-
-
-        # === LOSOWY VIEWPORT TIMING ===
-
-        if random.random() < 0.7:  # 70% czasu ustaw viewport
-
+        # Optional viewport tweak before any navigation
+        if random.random() < 0.7:
             await asyncio.sleep(random.uniform(0.1, 0.3))
-
             try:
-
                 await self._apply_viewport_mode("pre-goto", self.page)
-
             except Exception:
-
                 pass
-
-
-
-        url = self.start_url or "https://www.google.com"
-
-        log(f"đźŚ Navigating to: {url}", "INFO")
-
-
-
-        # === LUDZKIE "WPISYWANIE" URL ===
-
-        # Symulacja: klikniÄ™cie w pasek adresu + wpisanie + Enter
-
-        typing_delay = random.uniform(0.8, 2.0)  # 0.8-2s na "wpisanie"
-
-        await asyncio.sleep(typing_delay)
-
-
-
-        # === LOSOWY wait_until ===
-
-        wait_strategies = [
-
-            ("domcontentloaded", 0.3),  # 30%
-
-            ("load", 0.4),               # 40%
-
-            ("networkidle", 0.2),        # 20%
-
-            (None, 0.1),                 # 10% - nie czeka
-
-        ]
-
-        
-
-        strategy = random.choices(
-
-            [s[0] for s in wait_strategies],
-
-            weights=[s[1] for s in wait_strategies]
-
-        )[0]
-
-
-
+        url = (self.start_url or "").strip()
         try:
-
-            if strategy:
-
-                await self.page.goto(url, wait_until=strategy, timeout=self.goto_timeout_ms)
-
-            else:
-
-                # Nie czeka - bardziej ludzkie
-
-                await self.page.goto(url, wait_until="commit", timeout=self.goto_timeout_ms)
-
-                # Ale moĹĽe poczekaÄ‡ chwilÄ™ potem
-
-                await asyncio.sleep(random.uniform(0.5, 1.5))
-
-        except Exception as e:
-
-            log(f"âš ď¸Ź goto failed ({e}); retrying with delay", "WARNING")
-
-            
-
-            # === LUDZKIE RETRY (z frustracjÄ…) ===
-
-            await asyncio.sleep(random.uniform(1.0, 3.0))  # "zastanawia siÄ™"
-
-            
-
+            page_url = (self.page.url or "").strip()
+        except Exception:
+            page_url = ""
+        if url and getattr(self, "connect_existing", False):
+            if page_url and page_url.lower() not in ("about:blank", "chrome://newtab/", "chrome://new-tab-page/", "edge://newtab/"):
+                log(f"Skipping initial navigation (already at {page_url[:80]})", "INFO")
+                url = ""
+        if url:
+            log(f"Navigating to: {url}", "INFO")
+            typing_delay = random.uniform(0.8, 2.0)
+            await asyncio.sleep(typing_delay)
+            wait_strategies = [
+                ("domcontentloaded", 0.3),
+                ("load", 0.4),
+                ("networkidle", 0.2),
+                (None, 0.1),
+            ]
+            strategy = random.choices(
+                [s[0] for s in wait_strategies],
+                weights=[s[1] for s in wait_strategies],
+            )[0]
             try:
-
-                self.page = await self.context.new_page()
-
-                await self._handle_new_page(self.page)
-
-                
-
-                # Drugi raz moĹĽe byÄ‡ szybszy (niecierpliwoĹ›Ä‡)
-
-                await asyncio.sleep(random.uniform(0.3, 0.8))
-
-                await self.page.goto(url, wait_until="domcontentloaded", timeout=self.goto_timeout_ms)
-
-            except Exception as e2:
-
-                log(f"âťŚ goto retry failed: {e2}", "ERROR")
-
-                raise
-
-
-
-        # === POST-LOAD SETTLING ===
-
-        # CzĹ‚owiek czeka aĹĽ strona "siÄ™ uspokoi"
-
-        settle_time = random.uniform(0.5, 2.0)
-
-        await asyncio.sleep(settle_time)
-
-
-
-        if random.random() < 0.3:  # 30% czasu adjust viewport po zaĹ‚adowaniu
-
-            try:
-
-                await self._apply_viewport_mode("post-goto", self.page)
-
-            except Exception:
-
-                pass
-
-
-
+                if strategy:
+                    await self.page.goto(url, wait_until=strategy, timeout=self.goto_timeout_ms)
+                else:
+                    await self.page.goto(url, wait_until="commit", timeout=self.goto_timeout_ms)
+                    await asyncio.sleep(random.uniform(0.5, 1.5))
+            except Exception as e:
+                log(f"go to failed ({e}); retrying with delay", "WARNING")
+                await asyncio.sleep(random.uniform(1.0, 3.0))
+                try:
+                    self.page = await self.context.new_page()
+                    await self._handle_new_page(self.page)
+                    await asyncio.sleep(random.uniform(0.3, 0.8))
+                    await self.page.goto(url, wait_until="domcontentloaded", timeout=self.goto_timeout_ms)
+                except Exception as e2:
+                    log(f"goto retry failed: {e2}", "ERROR")
+                    raise
+            settle_time = random.uniform(0.5, 2.0)
+            await asyncio.sleep(settle_time)
+            if random.random() < 0.3:
+                try:
+                    await self._apply_viewport_mode("post-goto", self.page)
+                except Exception:
+                    pass
+        else:
+            log("Initial navigation skipped (no start_url provided).", "INFO")
         await self._register_page(self.page)
-
         self.active_page_id = str(id(self.page))
-
-
-
-        # === START BACKGROUND TASKS (z opĂłĹşnieniem) ===
-
+        # Opcjonalnie otwórz dodatkowe karty na starcie
+        for extra_url in self.extra_urls:
+            url2 = (extra_url or "").strip()
+            if not url2:
+                continue
+            try:
+                p_extra = await self.context.new_page()
+                await self._handle_new_page(p_extra)
+                await asyncio.sleep(random.uniform(0.2, 0.6))
+                await p_extra.goto(url2, wait_until="domcontentloaded", timeout=self.goto_timeout_ms)
+                await asyncio.sleep(random.uniform(0.2, 0.6))
+                log(f"Extra tab opened: {url2}", "INFO")
+            except Exception as extra_err:
+                log(f"Extra tab failed ({url2}): {extra_err}", "WARNING")
         await asyncio.sleep(random.uniform(0.2, 0.5))
-
-        
-
         if self.watchdog_task:
-
             self.watchdog_task.cancel()
-
         if self.focus_poll_task:
-
             self.focus_poll_task.cancel()
-
         if self.ocr_poll_task:
-
             self.ocr_poll_task.cancel()
-
-        
-
         self.watchdog_task = asyncio.create_task(self._watchdog_loop())
         self.focus_poll_task = asyncio.create_task(self._focus_poll_loop())
-        # OCR stripe dump ma działać zawsze, niezależnie od flag
         self.ocr_poll_task = asyncio.create_task(self._ocr_strip_poll_loop())
-
-
-
-
-        log(f"âś… Ready: {self.page.url[:80]} | mode={self.viewport_mode}", "SUCCESS")
-
-
+        log(f"Ready: {self.page.url[:80]} | mode={self.viewport_mode}", "SUCCESS")
 
     async def run(self):
 
-        """STEALTH RUN - naturalne wzorce aktywnoĹ›ci"""
-
-        
+        """STEALTH RUN - naturalne wzorce aktywno?ci"""
 
         await self.start()
 
-        log(f"đźź˘ Recorder running | Output: {self.output_dir}", "SUCCESS")
+        log(f"?? Recorder running | Output: {self.output_dir}", "SUCCESS")
 
-        
-
-        # === ZMIENNE PARAMETRY (nie staĹ‚e!) ===
-
+        # === ZMIENNE PARAMETRY (nie sta?e!) ===
         base_snapshot_interval = self.snapshot_interval
-
         last_snapshot_time = 0.0
-
         last_gc_time = time.time()
 
-        
-
         # Losowy GC interval (45-90s zamiast zawsze 60)
-
         gc_interval = random.uniform(45, 90)
 
-        
-
-        # Activity pattern (symuluje uwagÄ™ uĹĽytkownika)
-
+        # Activity pattern (symuluje uwag? u?ytkownika)
         activity_level = 1.0  # 1.0 = aktywny, 0.1 = nieaktywny
-
         last_activity_change = time.time()
-
-        
+        next_activity_change = last_activity_change + random.uniform(20, 60)
 
         while self.recording:
 
@@ -1519,118 +1419,95 @@ class LiveRecorderBase:
 
                 now = time.time()
 
-                
-
-                # === SYMULACJA AKTYWNOĹšCI UĹ»YTKOWNIKA ===
-
-                # Co 20-60s zmieĹ„ poziom aktywnoĹ›ci
-
-                if now - last_activity_change > random.uniform(20, 60):
+                # === SYMULACJA AKTYWNO?CI U?YTKOWNIKA ===
+                # Co 20-60s zmie? poziom aktywno?ci
+                if now >= next_activity_change:
 
                     # 70% aktywny, 30% nieaktywny/AFK
-
                     activity_level = random.choices([1.0, 0.1], weights=[0.7, 0.3])[0]
 
                     last_activity_change = now
-
-                    
+                    next_activity_change = now + random.uniform(20, 60)
 
                     if activity_level < 0.5:
 
-                        log("đź’¤ User inactive/AFK simulation", "DEBUG")
-
-                
+                        log("?? User inactive/AFK simulation", "DEBUG")
 
                 # === NATURALNY SNAPSHOT INTERVAL ===
-
-                # Dodaj jitter i uwzglÄ™dnij aktywnoĹ›Ä‡
-
+                # Dodaj jitter i uwzgl?dnij aktywno??
                 jittered_interval = base_snapshot_interval * random.uniform(0.8, 1.2)
 
-                
-
-                # JeĹ›li nieaktywny, rzadsze snapshoty
-
+                # Je?li nieaktywny, rzadsze snapshoty
                 if activity_level < 0.5:
 
                     jittered_interval *= random.uniform(2.0, 4.0)
 
-                
+                time_since_snapshot = now - last_snapshot_time
+                force_snap = bool(getattr(self, "force_next_snapshot", False))
+                if not force_snap and time_since_snapshot < jittered_interval:
+                    # je?li nie pora na snapshot, po?pij i oddaj CPU
+                    remaining = jittered_interval - time_since_snapshot
+                    idle_floor = 0.02 if activity_level > 0.5 else 0.08
+                    idle_ceiling = 0.6 if activity_level > 0.5 else 1.0
+                    await asyncio.sleep(min(max(idle_floor, remaining * 0.5), idle_ceiling))
+                    continue
 
-                if (now - last_snapshot_time) >= jittered_interval:
+                # Czasem (5%) pomi? snapshot (lag, rozproszenie)
+                if force_snap or random.random() > 0.05:
 
-                    # Czasem (5%) pomiĹ„ snapshot (lag, rozproszenie)
+                    self.force_next_snapshot = False
 
-                    if random.random() > 0.05:
+                    snapshot_task = asyncio.create_task(self._do_snapshot())
 
-                        snapshot_task = asyncio.create_task(self._do_snapshot())
+                    # Timeout te? z jitterem
+                    timeout = jittered_interval * random.uniform(1.8, 2.5)
+                    # Adjust timeout to realistic upper bounds based on DOM ops
+                    timeout = max(
 
-                        
+                        timeout,
 
-                        # Timeout teĹĽ z jitterem
+                        3.0,
 
-                        timeout = jittered_interval * random.uniform(1.8, 2.5)
+                        (CONTENT_TIMEOUT_MS / 1000.0) * 2.2,
 
-                        # Adjust timeout to realistic upper bounds based on DOM ops
+                        (SCREENSHOT_TIMEOUT_MS / 1000.0) * 1.5,
 
-                        timeout = max(
+                        jittered_interval * 3.0,
 
-                            timeout,
+                    )
 
-                            3.0,
+                    try:
 
-                            (CONTENT_TIMEOUT_MS / 1000.0) * 2.2,
+                        await asyncio.wait_for(snapshot_task, timeout=timeout)
 
-                            (SCREENSHOT_TIMEOUT_MS / 1000.0) * 1.5,
+                    except asyncio.TimeoutError:
 
-                            jittered_interval * 3.0,
+                        log("?? Snapshot timeout", "WARNING")
 
-                        )
+                        self.stats["timeouts"] += 1
 
-                        
+                else:
 
-                        try:
+                    log("?? Skipped snapshot (distracted)", "DEBUG")
 
-                            await asyncio.wait_for(snapshot_task, timeout=timeout)
-
-                        except asyncio.TimeoutError:
-
-                            log("âš ď¸Ź Snapshot timeout", "WARNING")
-
-                            self.stats["timeouts"] += 1
-
-                    else:
-
-                        log("đź’­ Skipped snapshot (distracted)", "DEBUG")
-
-                    
-
-                    last_snapshot_time = now
-
-                
+                last_snapshot_time = time.time()
 
                 # === NATURALNY GC PATTERN ===
-
-                # Nie co dokĹ‚adnie X sekund!
-
-                if now - last_gc_time > gc_interval:
+                # Nie co dok?adnie X sekund!
+                if time.time() - last_gc_time > gc_interval:
 
                     # 80% szans na GC (czasem zapomina)
-
                     if random.random() < 0.8:
 
                         gc.collect()
 
-                        last_gc_time = now
+                        last_gc_time = time.time()
 
-                        # NastÄ™pny GC za losowy czas
+                        # Nast?pny GC za losowy czas
 
                         gc_interval = random.uniform(45, 90)
 
-                    
-
                     # Performance stats tylko czasem (30%)
-
                     if random.random() < 0.3:
 
                         perf_stats = self.perf.get_stats()
@@ -1639,49 +1516,25 @@ class LiveRecorderBase:
 
                             slowest = max(perf_stats.items(), key=lambda x: x[1].get("max", 0))
 
-                            log(f"đź“Š Slowest: {slowest[0]} ({slowest[1]['max']:.2f}s)", "DEBUG")
-
-                
+                            log(f"?? Slowest: {slowest[0]} ({slowest[1]['max']:.2f}s)", "DEBUG")
 
                 # === NATURALNY SLEEP PATTERN ===
-
-                # Nie zawsze 0.01!
-
                 if activity_level > 0.5:
 
-                    # Aktywny: 10-50ms
-
-                    sleep_time = random.uniform(0.01, 0.05)
+                    # Aktywny: 20-80ms
+                    sleep_time = random.uniform(0.02, 0.08)
 
                 else:
 
-                    # Nieaktywny: 100-500ms
-
-                    sleep_time = random.uniform(0.1, 0.5)
-
-                
+                    # Nieaktywny: 120-600ms
+                    sleep_time = random.uniform(0.12, 0.6)
 
                 await asyncio.sleep(sleep_time)
 
-                
-
             except Exception as e:
 
-                log(f"âťŚ Loop error: {e}", "ERROR")
+                log(f"? Loop error: {e}", "ERROR")
 
                 # Losowy backoff
 
                 await asyncio.sleep(random.uniform(0.3, 1.0))
-
-
-
-
-
-
-
-
-
-
-
-
-

@@ -5,6 +5,7 @@ import socket
 import subprocess  
 import sys  
 import time  
+from pathlib import Path  
 from typing import Optional  
 import re as _re  
 import re as _re  
@@ -34,6 +35,17 @@ try:
         from ai_recorder_common import ensure_dir, log, PageTrack3r, norm_text, domain_from_url, fuzzy_ratio  
 except Exception:  
     from ai_recorder_common import ensure_dir, log, PageTrack3r, norm_text, domain_from_url, fuzzy_ratio  # type: ignore  
+
+ROOT_PATH = Path(__file__).resolve().parents[1]
+DATA_SCREEN_DIR = ROOT_PATH / "data" / "screen"
+OCR_DEBUG_DIR = DATA_SCREEN_DIR / "debug"
+
+def _ocr_debug_dir() -> Path:
+    try:
+        ensure_dir(OCR_DEBUG_DIR)
+    except Exception:
+        pass
+    return OCR_DEBUG_DIR
   
   
 _HEADER_PROFILE = {
@@ -436,6 +448,10 @@ class LiveRecorderBrowserMixin:
         return
 
     def _build_stealth_script(self) -> str:
+        stealth_mode = getattr(self, "stealth_mode", "off")
+        if stealth_mode in ("off", "none", "native"):
+            self._STEALTH_INIT_JS = ""
+            return ""
         return self._STEALTH_INIT_JS or ""
 
     async def _install_stealth_init_script(self, ctx) -> None:
@@ -454,6 +470,8 @@ class LiveRecorderBrowserMixin:
         return
 
     def _close_existing_browsers(self) -> None:
+        if getattr(self, "connect_existing", False):
+            return
         if not sys.platform.startswith("win"):
             return
         kill_list = [
@@ -508,15 +526,30 @@ class LiveRecorderBrowserMixin:
             if not browser_exe:  
                 raise RuntimeError("Chrome/Edge executable not found")  
   
-        self._close_existing_browsers()
         ensure_dir(self.user_data_dir)
+        active_file = self.user_data_dir / "DevToolsActivePort"
+        # Try reusing existing endpoint first regardless of flag
+        existing_endpoint = await self._reuse_existing_chrome(active_file)
+        if existing_endpoint:
+            log(f"Reusing existing browser via DevToolsActivePort: {existing_endpoint}", "INFO")
+            return existing_endpoint
+
+        # Only close browsers when we explicitly don't want to attach
+        if not getattr(self, "connect_existing", False):
+            self._close_existing_browsers()
         exe_name = os.path.basename(browser_exe).lower() if browser_exe else ""
         is_opera = "opera" in exe_name
         self._is_opera = is_opera
-        active_file = self.user_data_dir / "DevToolsActivePort"
         existing_endpoint = await self._reuse_existing_chrome(active_file)
         if existing_endpoint:
             return existing_endpoint
+
+        # Remove stale DevToolsActivePort so we don't reuse an old, dead port.
+        try:
+            if active_file.exists():
+                active_file.unlink()
+        except Exception:
+            pass
   
         args = [  
             browser_exe,  
@@ -556,10 +589,11 @@ class LiveRecorderBrowserMixin:
         if getattr(self, "user_agent", None):
             args.append(f"--user-agent={self.user_agent}")
         env = os.environ.copy()  
-  
+
         max_wait = 90 if not is_opera else 120
         launch_attempts = 1
         last_error = None
+        endpoint_port = None
 
         for attempt in range(launch_attempts):
             self.chrome_process = subprocess.Popen(
@@ -576,14 +610,23 @@ class LiveRecorderBrowserMixin:
                 await asyncio.sleep(1.0)
 
             start_t = time.time()
+            launch_epoch = start_t
             success = False
             while time.time() - start_t < max_wait:
                 if active_file.exists():
                     try:
+                        # Skip stale file from previous runs and wait for a fresh CDP listener.
+                        if active_file.stat().st_mtime < launch_epoch:
+                            await asyncio.sleep(0.05)
+                            continue
                         txt = active_file.read_text(encoding="utf-8").strip().splitlines()
                         if txt and txt[0].strip().isdigit():
-                            success = True
-                            break
+                            port_candidate = int(txt[0].strip())
+                            endpoint_candidate = f"http://127.0.0.1:{port_candidate}"
+                            if await self._probe_cdp_endpoint(endpoint_candidate, attempts=3):
+                                endpoint_port = port_candidate
+                                success = True
+                                break
                     except Exception:
                         pass
                 if self.chrome_process.poll() is not None:
@@ -607,9 +650,14 @@ class LiveRecorderBrowserMixin:
                 "DevToolsActivePort not found. Upewnij się, że wszystkie okna Chrome/Opera są zamknięte i spróbuj ponownie."
             )
   
-        txt = active_file.read_text(encoding="utf-8").strip().splitlines()  
-        port = int(txt[0].strip())  
-        endpoint = f"http://127.0.0.1:{port}"  
+        if endpoint_port is None:
+            txt = active_file.read_text(encoding="utf-8").strip().splitlines()
+            if txt and txt[0].strip().isdigit():
+                endpoint_port = int(txt[0].strip())
+        if endpoint_port is None:
+            raise RuntimeError("DevToolsActivePort is empty or invalid after Chrome launch")
+
+        endpoint = f"http://127.0.0.1:{endpoint_port}"  
         log(f"CDP endpoint: {endpoint}", "SUCCESS")  
         return endpoint  
   
@@ -669,13 +717,14 @@ class LiveRecorderBrowserMixin:
   
         # add stealth init to every context; then optional activity listeners  
         for ctx in contexts:  
-            with contextlib.suppress(Exception):
-                await ctx.set_extra_http_headers(dict(_HEADER_PROFILE))
-            with contextlib.suppress(Exception):  
-                await self._install_stealth_init_script(ctx)  
-            if not getattr(self, 'dom_only', False):  
+            if getattr(self, "stealth_mode", "off") not in ("off", "none", "native"):
+                with contextlib.suppress(Exception):
+                    await ctx.set_extra_http_headers(dict(_HEADER_PROFILE))
                 with contextlib.suppress(Exception):  
-                    await self._install_activity_listeners_init_script(ctx)  
+                    await self._install_stealth_init_script(ctx)  
+                if not getattr(self, 'dom_only', False):  
+                    with contextlib.suppress(Exception):  
+                        await self._install_activity_listeners_init_script(ctx)  
             with contextlib.suppress(Exception):  
                 ctx.on("page", lambda p, _ctx=ctx: asyncio.create_task(self._handle_new_page(p)))  
   
@@ -687,10 +736,11 @@ class LiveRecorderBrowserMixin:
         if pages:  
             self.page = pages[0]  
             for p in pages:  
-                with contextlib.suppress(Exception):  
-                    await p.add_init_script(self._STEALTH_INIT_JS)  
-                with contextlib.suppress(Exception):  
-                    await p.evaluate(self._STEALTH_INIT_JS)  
+                if getattr(self, "stealth_mode", "off") not in ("off", "none", "native"):
+                    with contextlib.suppress(Exception):  
+                        await p.add_init_script(self._STEALTH_INIT_JS)  
+                    with contextlib.suppress(Exception):  
+                        await p.evaluate(self._STEALTH_INIT_JS)  
                 with contextlib.suppress(Exception):  
                     await self._handle_new_page(p)  
             # Choose best active once after initial registration  
@@ -705,10 +755,11 @@ class LiveRecorderBrowserMixin:
                 if pages:  
                     self.page = pages[0]  
                     for p in pages:  
-                        with contextlib.suppress(Exception):  
-                            await p.add_init_script(self._STEALTH_INIT_JS)  
-                        with contextlib.suppress(Exception):  
-                            await p.evaluate(self._STEALTH_INIT_JS)  
+                        if getattr(self, "stealth_mode", "off") not in ("off", "none", "native"):
+                            with contextlib.suppress(Exception):  
+                                await p.add_init_script(self._STEALTH_INIT_JS)  
+                            with contextlib.suppress(Exception):  
+                                await p.evaluate(self._STEALTH_INIT_JS)  
                         with contextlib.suppress(Exception):  
                             await self._handle_new_page(p)  
                     with contextlib.suppress(Exception):  
@@ -718,8 +769,9 @@ class LiveRecorderBrowserMixin:
                 await asyncio.sleep(0.2)  
             if not pages:  
                 self.page = await self.context.new_page()  
-                with contextlib.suppress(Exception):  
-                    await self.page.add_init_script(self._STEALTH_INIT_JS)  
+                if getattr(self, "stealth_mode", "off") not in ("off", "none", "native"):
+                    with contextlib.suppress(Exception):  
+                        await self.page.add_init_script(self._STEALTH_INIT_JS)  
                 await self._handle_new_page(self.page)  
                 log("CDP connected + fresh page created", "SUCCESS")  
 
@@ -810,20 +862,20 @@ class LiveRecorderBrowserMixin:
             await self._apply_viewport_mode("new-page", p)  
         except Exception:  
             pass  
-        # Natural headers  
-        try:  
-            await p.set_extra_http_headers(dict(_HEADER_PROFILE))  
-        except Exception:  
-            pass  
-        # ensure stealth on new pages  
-        try:  
-            await p.add_init_script(self._STEALTH_INIT_JS)  
-        except Exception:  
-            pass  
-        try:  
-            await p.evaluate(self._STEALTH_INIT_JS)  
-        except Exception:  
-            pass  
+        if getattr(self, "stealth_mode", "off") not in ("off", "none", "native"):
+            try:  
+                await p.set_extra_http_headers(dict(_HEADER_PROFILE))  
+            except Exception:  
+                pass  
+            # ensure stealth on new pages  
+            try:  
+                await p.add_init_script(self._STEALTH_INIT_JS)  
+            except Exception:  
+                pass  
+            try:  
+                await p.evaluate(self._STEALTH_INIT_JS)  
+            except Exception:  
+                pass  
         if not getattr(self, 'dom_only', False):  
             with contextlib.suppress(Exception):  
                 await self._inject_activity_observer(p, str(id(p)))  
@@ -1087,6 +1139,7 @@ class LiveRecorderBrowserMixin:
         try:  
             # Screen-based OCR: detect active tab bbox and OCR only that + centered address slice  
             # Reuse a single MSS instance to reduce overhead  
+            prev_sig = getattr(self, "_last_ocr_sig", None)  
             sct = getattr(self, '_mss_inst', None)  
             if sct is None:  
                 self._mss_inst = _mss.mss()  
@@ -1108,6 +1161,10 @@ class LiveRecorderBrowserMixin:
                 v2 = int(_np.frombuffer(shot_addr.rgb, dtype=_np.uint8)[::64].sum())  
                 sig = (v1, v2, shot_tabs.size, shot_addr.size)  
                 self._last_ocr_sig = sig  
+                if prev_sig == sig:  
+                    cached = getattr(self, "_last_ocr_hint", None)  
+                    if cached is not None:  
+                        return cached  
             except Exception:  
                 pass  
             finally:  
@@ -1177,11 +1234,11 @@ class LiveRecorderBrowserMixin:
                     except Exception:  
                         fallback = ''  
                 full = fallback  
+            self._last_ocr_hint = full  
             # Save debug crops and tokens  
             try:  
                 if getattr(self, 'output_dir', None):  
-                    debug_dir = (self.output_dir / 'debug')  
-                    ensure_dir(debug_dir)  
+                    debug_dir = _ocr_debug_dir()  
                     p_strip = (debug_dir / 'ocr_strip1.png')  
                     p_strip_act = (debug_dir / 'ocr_strip1_active.png')  
                     p_addr = (debug_dir / 'ocr_strip2_center.png')  
@@ -1343,11 +1400,7 @@ class LiveRecorderBrowserMixin:
                         dbg['core'] = core  
                         dbg['candidates'] = debug_cands  
                         import json  
-                        debug_dir = (self.output_dir / 'debug')  
-                        try:  
-                            ensure_dir(debug_dir)  
-                        except Exception:  
-                            pass  
+                        debug_dir = _ocr_debug_dir()  
                         with open(debug_dir / 'ocr_debug.json', 'w', encoding='utf-8') as f:  
                             json.dump(dbg, f, ensure_ascii=False, indent=2)  
                 except Exception:  
@@ -1698,11 +1751,7 @@ class LiveRecorderBrowserMixin:
                 })  
             # Persist JSON next to strips  
             if getattr(self, 'output_dir', None):  
-                debug_dir = (self.output_dir / 'debug')  
-                try:  
-                    ensure_dir(debug_dir)  
-                except Exception:  
-                    pass  
+                debug_dir = _ocr_debug_dir()  
                 import json  
                 dbg = getattr(self, '_last_ocr_debug', {}) or {}  
                 dbg['hint'] = hint  

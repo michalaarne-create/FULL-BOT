@@ -5,8 +5,8 @@ End-to-end hover pipeline:
 
 1) Start ControlAgent (UDP) in a background process
 2) Wait 2s
-3) Screenshot the screen
-4) Run EasyOCR + hover dots
+3) Load screenshot captured by the main pipeline (no self-capture)
+4) Run PaddleOCR + hover dots
 5) Build trajectory from dots and send to agent (cmd=path)
 6) Agent executes with timing based on trajectory.json/transforms logic
 7) No clicking – just cursor painting
@@ -36,11 +36,6 @@ try:
 except Exception as e:  # pragma: no cover - runtime dep
     keyboard = None  # type: ignore
 
-try:
-    import mss
-except Exception as e:  # pragma: no cover - runtime dep
-    raise ImportError("mss is required. Install with `pip install mss`.") from e
-
 # Make project modules importable
 PROJECT_ROOT = next(
     (p for p in Path(__file__).resolve().parents if (p / "envs").exists()),
@@ -49,11 +44,15 @@ PROJECT_ROOT = next(
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
-from utils.ocr_features import (
-    OCRNotAvailableError,
-    create_easyocr_reader,
+DATA_SCREEN_DIR = PROJECT_ROOT / "data" / "screen"
+CURRENT_RUN_DIR = DATA_SCREEN_DIR / "current_run"
+DEFAULT_SCREENSHOT = CURRENT_RUN_DIR / "screenshot.png"
+
+from utils.ocr_features import OCRNotAvailableError
+from scripts.hard_bot.hover_bot import (
+    create_paddleocr_reader,
+    process_image,  # reuse dots/boxes generation
 )
-from scripts.hard_bot.hover_bot import process_image  # reuse dots/boxes generation
 
 
 def _ensure_agent(port: int) -> subprocess.Popen:
@@ -69,16 +68,6 @@ def _ensure_agent(port: int) -> subprocess.Popen:
         creationflags = 0
     proc = subprocess.Popen(cmd, creationflags=creationflags)
     return proc
-
-
-def _capture_once(size: Tuple[int, int] | None = None) -> np.ndarray:
-    with mss.mss() as sct:  # type: ignore[attr-defined]
-        mon = sct.monitors[0]
-        raw = sct.grab(mon)
-        frame = cv2.cvtColor(np.array(raw, dtype=np.uint8), cv2.COLOR_BGRA2BGR)
-    if size is not None and (frame.shape[1] != size[0] or frame.shape[0] != size[1]):
-        frame = cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
-    return frame
 
 
 def _as_rect(box: List[List[float]]) -> Tuple[int, int, int, int]:
@@ -178,12 +167,25 @@ def _send_path(
     data = json.dumps(payload).encode("utf-8")
     sock.sendto(data, ("127.0.0.1", port))
 
+def _load_image(path: Path) -> np.ndarray:
+    if not path.is_file():
+        raise FileNotFoundError(f"Brak pliku zrzutu ekranu: {path}")
+    frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if frame is None:
+        raise ValueError(f"Nie udało się wczytać obrazu: {path}")
+    return frame
 
 def main():
     import argparse
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument(
+        "--image",
+        type=Path,
+        default=None,
+        help="Ścieżka do gotowego zrzutu ekranu (domyślnie: data/screen/current_run/screenshot.png).",
+    )
     ap.add_argument("--speed-factor", type=float, default=1.0)
     ap.add_argument("--gap-boost", type=float, default=3.0)
     ap.add_argument("--line-jump-boost", type=float, default=1.5)
@@ -221,21 +223,17 @@ def main():
         listener = keyboard.Listener(on_press=on_press)
         listener.start()
 
-    # 3) screenshot
-    frame = _capture_once()
+    # 3) screenshot (reuse the one captured by the main pipeline)
+    image_path = Path(args.image) if args.image else DEFAULT_SCREENSHOT
+    frame = _load_image(image_path)
 
     # 4) OCR + dots
     try:
-        reader = create_easyocr_reader(lang="en")
+        reader = create_paddleocr_reader(lang="en")
     except OCRNotAvailableError as e:
-        raise ImportError("easyocr is required. Install with `pip install easyocr`.") from e
+        raise ImportError("paddleocr is required. Install with `pip install paddleocr`.") from e
 
-    tmp_dir = PROJECT_ROOT / "data" / "temp"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    img_path = tmp_dir / "screen_ocr.png"
-    cv2.imwrite(str(img_path), frame)
-
-    sequences, annotated = process_image(img_path, reader=reader)
+    sequences, annotated = process_image(image_path, reader=reader)
 
     # 5) build path and send to agent
     points, gaps, line_jumps = _build_path_and_meta([{

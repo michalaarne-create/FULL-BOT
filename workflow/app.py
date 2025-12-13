@@ -6,6 +6,8 @@ import json as pyjson
 import math
 import time
 import threading
+from pathlib import Path
+import contextlib
 
 WINDOW_TAG = "main_window"
 CANVAS_TAG = "canvas"
@@ -15,6 +17,31 @@ JSON_TEXT_TAG = "json_viewer_text"
 NOTE_EDITOR_TAG = "note_editor"
 NOTE_TEXT_TAG = "note_editor_text"
 STATE_FILE = "flowui_state.json"
+PIPELINE_STATUS_TAG = "pipeline_status"
+BACKUP_WINDOW_TAG = "pipeline_backup_window"
+PIPELINE_LIST_TAG = "pipeline_run_list"
+PIPELINE_TREE_TAG = "pipeline_tree"
+MAX_BACKUP_DAYS = 7
+POLISH_DAY_NAMES = ["Poniedzialek", "Wtorek", "Sroda", "Czwartek", "Piatek", "Sobota", "Niedziela"]
+ROOT_DIR = Path(__file__).resolve().parents[1]
+PIPELINE_RUNS_DIR = ROOT_DIR / "data" / "screen" / "pipeline_runs"
+DATA_SCREEN_DIR = ROOT_DIR / "data" / "screen"
+DEBUG_SCREEN_DIR = DATA_SCREEN_DIR / "debug"
+DEBUG_SCREEN_DIR.mkdir(parents=True, exist_ok=True)
+RAW_SCREENS_CURRENT_DIR = DATA_SCREEN_DIR / "raw" / "raw_screens_current"
+CURRENT_RUN_DIR = DATA_SCREEN_DIR / "current_run"
+REGION_GROW_ANNOT_DIR = DATA_SCREEN_DIR / "region_grow" / "region_grow_annot_current"
+REGION_GROW_CURRENT_DIR = DATA_SCREEN_DIR / "region_grow" / "region_grow_current"
+RATE_RESULTS_CURRENT_DIR = DATA_SCREEN_DIR / "rate" / "rate_results_current"
+RATE_SUMMARY_CURRENT_DIR = DATA_SCREEN_DIR / "rate" / "rate_summary_current"
+HOVER_OUTPUT_DIR = DATA_SCREEN_DIR / "hover" / "hover_output_current"
+RATE_RESULTS_DEBUG_CURRENT_DIR = DATA_SCREEN_DIR / "rate" / "rate_results_debug_current"
+HOVER_INPUT_CURRENT_DIR = DATA_SCREEN_DIR / "hover" / "hover_input_current"
+HOVER_PATH_CURRENT_DIR = DATA_SCREEN_DIR / "hover" / "hover_path_current"
+HOVER_SPEED_CURRENT_DIR = DATA_SCREEN_DIR / "hover" / "hover_speed_current"
+HOVER_POINTS_ON_PATH_CURRENT_DIR = DATA_SCREEN_DIR / "hover" / "hover_points_on_path_current"
+HOVER_POINTS_ON_SPEED_CURRENT_DIR = DATA_SCREEN_DIR / "hover" / "hover_points_on_speed_current"
+FILE_DIALOG_TAG = "file_dialog_id"
 
 # Stan
 screens = []
@@ -22,6 +49,8 @@ json_objects = []
 notes = []
 screen_counter = 0
 texture_counter = 0
+undo_stack = []
+UNDO_LIMIT = 20
 
 lines = []
 
@@ -60,8 +89,315 @@ add_note_mode = False
 # Aktywna notatka do edycji
 active_note_id = None
 
-# Flaga - czy trzeba zaktualizować teksturę po resize
+# Flaga - czy trzeba zaktualizowa─ç tekstur─Ö po resize
 needs_texture_update = False
+
+
+# ================== PIPELINE DEFAULT STATE ==================
+
+def _latest_file(dir_path: Path, suffixes) -> str | None:
+    try:
+        candidates = [p for p in Path(dir_path).iterdir() if p.is_file() and p.suffix.lower() in suffixes]
+    except Exception:
+        return None
+    if not candidates:
+        return None
+    return str(max(candidates, key=lambda p: p.stat().st_mtime))
+
+
+def _all_files(dir_path: Path, suffixes) -> list[Path]:
+    """Zwróć wszystkie pliki z katalogu o podanych rozszerzeniach (posortowane po czasie)."""
+    try:
+        candidates = [p for p in Path(dir_path).iterdir() if p.is_file() and p.suffix.lower() in suffixes]
+    except Exception:
+        return []
+    return sorted(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _default_size_for_image(path: str) -> tuple[float, float]:
+    def _scale_to_max(w: float, h: float, max_width: float = 700.0) -> tuple[float, float]:
+        """Skaluje proporcjonalnie do max_width (używane tylko do WYŚWIETLANIA)."""
+        if w <= max_width:
+            return w, h
+        scale = max_width / w
+        return w * scale, h * scale
+
+    try:
+        with Image.open(path) as im:
+            w, h = float(im.width), float(im.height)
+            return _scale_to_max(w, h)
+    except Exception:
+        return 1920.0, 1080.0
+
+
+def build_pipeline_state() -> dict:
+    """Zbuduj uporządkowany widok CAŁEGO pipeline'u z artefaktów *_current* i debug.
+
+    Główna ścieżka (capture -> region -> hover/rating -> summary) leci w pierwszym rzędzie,
+    a wszystkie debugowe pliki wiszą w kolumnach poniżej swoich „rodziców”.
+    """
+    # Kolumny (x) – osobne dla każdego głównego etapu
+    x_capture = 0.0
+    x_region_annot = 1400.0
+    x_region_json = 2600.0
+    x_hover = 3800.0
+    x_rating = 5000.0
+    x_summary = 6200.0
+
+    # Rzędy (y)
+    y_main = 0.0          # główna linia pipeline'u
+    row_step = 520.0      # odstęp między kolejnymi „piętrami” debugów
+
+    screens_state: list[dict] = []
+    json_state: list[dict] = []
+    notes_state: list[dict] = []
+    lines_state: list[dict] = []
+
+    added_paths: set[str] = set()
+
+    def add_screen(path: Path, x: float, y: float):
+        sp = str(path)
+        if sp in added_paths:
+            return None
+        w, h = _default_size_for_image(sp)
+        obj = {"path": sp, "x": x, "y": y, "w": w, "h": h}
+        screens_state.append(obj)
+        added_paths.add(sp)
+        # Niebieski przypis z nazwą pliku tuż pod screenem
+        note_text = os.path.basename(sp)
+        note_width = 260.0
+        note_height = 70.0
+        notes_state.append(
+            {
+                "text": note_text,
+                "x": x,
+                "y": y + h + 30.0,
+                "w": note_width,
+                "h": note_height,
+            }
+        )
+        return obj
+
+    def add_json_obj(path: Path, x: float, y: float):
+        sp = str(path)
+        if sp in added_paths:
+            return None
+        obj = {"path": sp, "x": x, "y": y, "w": 260.0, "h": 180.0}
+        json_state.append(obj)
+        added_paths.add(sp)
+        return obj
+
+    # ===== CAPTURE + OCR DEBUG =====
+    capture_files = _all_files(RAW_SCREENS_CURRENT_DIR, {".png", ".jpg", ".jpeg"})
+    if not capture_files:
+        capture_files = _all_files(CURRENT_RUN_DIR, {".png", ".jpg", ".jpeg"})
+
+    capture_main = None
+    debug_row = 1
+    for idx, p in enumerate(capture_files):
+        if idx == 0:
+            capture_main = add_screen(p, x_capture, y_main)
+        else:
+            add_screen(p, x_capture, y_main + debug_row * row_step)
+            debug_row += 1
+
+    ocr_debug_files = _all_files(DEBUG_SCREEN_DIR, {".png"})
+    for p in ocr_debug_files:
+        add_screen(p, x_capture, y_main + debug_row * row_step)
+        debug_row += 1
+
+    # ===== REGION_GROW =====
+    annot_files = _all_files(REGION_GROW_ANNOT_DIR, {".png", ".jpg", ".jpeg"})
+    region_annot_main = None
+    debug_row_region_annot = 1
+    for idx, p in enumerate(annot_files):
+        if idx == 0:
+            region_annot_main = add_screen(p, x_region_annot, y_main)
+        else:
+            add_screen(p, x_region_annot, y_main + debug_row_region_annot * row_step)
+            debug_row_region_annot += 1
+
+    rg_json_files = _all_files(REGION_GROW_CURRENT_DIR, {".json"})
+    region_json_main = None
+    debug_row_region_json = 1
+    for idx, p in enumerate(rg_json_files):
+        if idx == 0:
+            region_json_main = add_json_obj(p, x_region_json, y_main)
+        else:
+            add_json_obj(p, x_region_json, y_main + debug_row_region_json * row_step)
+            debug_row_region_json += 1
+
+    # ===== HOVER (wszystkie debugowe obrazki i JSON-y) =====
+    hover_main_json = None
+    debug_row_hover = 1
+
+    # input / path / speed obrazy
+    hover_input_files = _all_files(HOVER_INPUT_CURRENT_DIR, {".png", ".jpg", ".jpeg"})
+    for p in hover_input_files:
+        add_screen(p, x_hover, y_main + debug_row_hover * row_step)
+        debug_row_hover += 1
+
+    hover_path_files = _all_files(HOVER_PATH_CURRENT_DIR, {".png", ".jpg", ".jpeg"})
+    for p in hover_path_files:
+        add_screen(p, x_hover, y_main + debug_row_hover * row_step)
+        debug_row_hover += 1
+
+    hover_speed_files = _all_files(HOVER_SPEED_CURRENT_DIR, {".png", ".jpg", ".jpeg"})
+    for p in hover_speed_files:
+        add_screen(p, x_hover, y_main + debug_row_hover * row_step)
+        debug_row_hover += 1
+
+    # punkty na ścieżce / prędkości – JSON/NPY/TXT
+    hover_points_path_files = _all_files(HOVER_POINTS_ON_PATH_CURRENT_DIR, {".json", ".npy", ".txt"})
+    for p in hover_points_path_files:
+        add_json_obj(p, x_hover, y_main + debug_row_hover * row_step)
+        debug_row_hover += 1
+
+    hover_points_speed_files = _all_files(HOVER_POINTS_ON_SPEED_CURRENT_DIR, {".json", ".npy", ".txt"})
+    for p in hover_points_speed_files:
+        add_json_obj(p, x_hover, y_main + debug_row_hover * row_step)
+        debug_row_hover += 1
+
+    # hover_output_current – JSON (ostatni jako główny) + PNG
+    hover_output_jsons = _all_files(HOVER_OUTPUT_DIR, {".json"})
+    if hover_output_jsons:
+        main_hover_json_path = hover_output_jsons[-1]
+        for p in hover_output_jsons:
+            if p == main_hover_json_path:
+                hover_main_json = add_json_obj(p, x_hover, y_main)
+            else:
+                add_json_obj(p, x_hover, y_main + debug_row_hover * row_step)
+                debug_row_hover += 1
+
+    hover_output_imgs = _all_files(HOVER_OUTPUT_DIR, {".png", ".jpg", ".jpeg"})
+    for p in hover_output_imgs:
+        add_screen(p, x_hover, y_main + debug_row_hover * row_step)
+        debug_row_hover += 1
+
+    # ===== RATING (wyniki + debug + summary) =====
+    rating_main_json = None
+    summary_main_json = None
+    debug_row_rating = 1
+    debug_row_summary = 1
+
+    rate_results_files = _all_files(RATE_RESULTS_CURRENT_DIR, {".json"})
+    for idx, p in enumerate(rate_results_files):
+        if idx == 0:
+            rating_main_json = add_json_obj(p, x_rating, y_main)
+        else:
+            add_json_obj(p, x_rating, y_main + debug_row_rating * row_step)
+            debug_row_rating += 1
+
+    # Debug ratingu – każdy osobny box pod rating_main_json
+    rate_debug_files = _all_files(RATE_RESULTS_DEBUG_CURRENT_DIR, {".json"})
+    for p in rate_debug_files:
+        add_json_obj(p, x_rating, y_main + debug_row_rating * row_step)
+        debug_row_rating += 1
+
+    # Summary (ostatni jako główny w osobnej kolumnie)
+    rate_summary_files = _all_files(RATE_SUMMARY_CURRENT_DIR, {".json"})
+    if rate_summary_files:
+        main_summary_path = rate_summary_files[-1]
+        for p in rate_summary_files:
+            if p == main_summary_path:
+                summary_main_json = add_json_obj(p, x_summary, y_main)
+            else:
+                add_json_obj(p, x_summary, y_main + debug_row_summary * row_step)
+                debug_row_summary += 1
+
+    # ===== Połączenia (główna gałąź + pionowe debugi) =====
+    def center_x(item): return item["x"] + item["w"] * 0.5
+    def center_y(item): return item["y"] + item["h"] * 0.5
+    def left_x(item): return item["x"]
+    def right_x(item): return item["x"] + item["w"]
+    def top_y(item): return item["y"]
+    def bottom_y(item): return item["y"] + item["h"]
+
+    def add_line(src, dst):
+        if not src or not dst:
+            return
+
+        dx = dst["x"] - src["x"]
+        dy = dst["y"] - src["y"]
+
+        # Poziome połączenia między etapami głównej ścieżki:
+        # linia idzie od prawej krawędzi źródła do lewej krawędzi celu,
+        # dzięki czemu nie przechodzi przez wnętrze boxów.
+        if abs(dy) < 1e-3:
+            if src["x"] <= dst["x"]:
+                x1 = right_x(src)
+                y1 = center_y(src)
+                x2 = left_x(dst)
+                y2 = center_y(dst)
+            else:
+                x1 = left_x(src)
+                y1 = center_y(src)
+                x2 = right_x(dst)
+                y2 = center_y(dst)
+        # Pionowe połączenia w kolumnie debugowej: od dołu elementu głównego
+        # do góry dziecka, by linia nie przecinała wnętrza.
+        elif abs(dx) < 1e-3:
+            if src["y"] <= dst["y"]:
+                x1 = center_x(src)
+                y1 = bottom_y(src)
+                x2 = center_x(dst)
+                y2 = top_y(dst)
+            else:
+                x1 = center_x(src)
+                y1 = top_y(src)
+                x2 = center_x(dst)
+                y2 = bottom_y(dst)
+        # Fallback dla nietypowych/ręcznie rysowanych połączeń: środki obu boxów.
+        else:
+            x1 = center_x(src)
+            y1 = center_y(src)
+            x2 = center_x(dst)
+            y2 = center_y(dst)
+
+        lines_state.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2})
+
+    # Główna, prosta ścieżka w pierwszym rzędzie
+    add_line(capture_main, region_annot_main or region_json_main)
+    add_line(region_annot_main, region_json_main)
+    add_line(region_json_main, hover_main_json)
+    add_line(region_json_main, rating_main_json)
+    add_line(rating_main_json, summary_main_json)
+
+    # Pionowe gałęzie debugowe
+    def connect_column(parent, x_col: float):
+        """Połącz element główny z wszystkimi obiektami w tej samej kolumnie poniżej."""
+        if not parent:
+            return
+        for obj in screens_state + json_state:
+            if obj is parent:
+                continue
+            if abs(obj["x"] - x_col) < 1e-3 and obj["y"] > parent["y"]:
+                add_line(parent, obj)
+
+    connect_column(capture_main, x_capture)
+    connect_column(region_annot_main, x_region_annot)
+    connect_column(region_json_main, x_region_json)
+    connect_column(hover_main_json, x_hover)
+    connect_column(rating_main_json, x_rating)
+    connect_column(summary_main_json, x_summary)
+
+    return {
+        "pan_x": -800.0,
+        "pan_y": -320.0,
+        "zoom": 0.23,
+        "screens": screens_state,
+        "json_objects": json_state,
+        "notes": notes_state,
+        "lines": lines_state,
+    }
+
+
+# ================== POMOCNICZE ==================
+
+# Pipeline history
+pipeline_runs = []
+pipeline_run_index = 0
+pipeline_runs_meta = []
 
 
 # ================== POMOCNICZE ==================
@@ -75,9 +411,27 @@ def world_from_screen(mx, my):
     wy = (local_my - pan_y) / zoom
     return wx, wy
 
+def default_spawn_coords(margin: float = 40.0):
+    """Zwraca punkt startowy w centrum bieżącego widoku/ekranu."""
+    try:
+        vw = dpg.get_viewport_client_width()
+        vh = dpg.get_viewport_client_height()
+        if vw and vh:
+            return world_from_screen(vw * 0.5, vh * 0.5)
+    except Exception:
+        pass
+    if dpg.does_item_exist(CANVAS_TAG):
+        try:
+            cx, cy = dpg.get_item_rect_min(CANVAS_TAG)
+            return world_from_screen(cx + margin, cy + margin)
+        except Exception:
+            pass
+    return 0.0, 0.0
+
+
 
 def distance_point_to_line_segment(px, py, x1, y1, x2, y2):
-    """Odległość punktu od odcinka."""
+    """Odleg┼éo┼Ť─ç punktu od odcinka."""
     dx = x2 - x1
     dy = y2 - y1
     
@@ -93,7 +447,7 @@ def distance_point_to_line_segment(px, py, x1, y1, x2, y2):
 
 
 def create_json_texture(filename, width=200, height=150):
-    """Tworzy teksturę dla JSON."""
+    """Tworzy tekstur─Ö dla JSON."""
     img = Image.new("RGBA", (width, height), (255, 220, 100, 255))
     draw = ImageDraw.Draw(img)
     
@@ -122,22 +476,22 @@ def create_json_texture(filename, width=200, height=150):
 
 
 def create_note_texture(text, width=250, height=200):
-    """Tworzy teksturę dla notatki/bloczku."""
+    """Tworzy tekstur─Ö dla notatki/bloczku."""
     width = max(100, int(width))
     height = max(80, int(height))
     
-    img = Image.new("RGBA", (width, height), (173, 216, 230, 255))
+    img = Image.new("RGBA", (width, height), (88, 34, 135, 255))
     draw = ImageDraw.Draw(img)
     
-    draw.rectangle([0, 0, width-1, height-1], outline=(100, 150, 180, 255), width=3)
+    draw.rectangle([0, 0, width-1, height-1], outline=(120, 60, 170, 255), width=3)
     
     header_height = min(35, height // 4)
-    draw.rectangle([5, 5, width-5, header_height], fill=(135, 206, 250, 255))
+    draw.rectangle([5, 5, width-5, header_height], fill=(105, 50, 155, 255))
     
     try:
-        draw.text((10, 10), "📝 Notatka", fill=(0, 0, 0, 255))
+        draw.text((10, 10), "­čôŁ Notatka", fill=(180, 255, 180, 255))
     except:
-        draw.text((10, 10), "NOTE", fill=(0, 0, 0, 255))
+        draw.text((10, 10), "NOTE", fill=(180, 255, 180, 255))
     
     lines_text = []
     current_line = ""
@@ -162,7 +516,7 @@ def create_note_texture(text, width=250, height=200):
     
     for i, line in enumerate(lines_text[:max_lines]):
         try:
-            draw.text((10, y_offset + i * line_height), line, fill=(0, 0, 0, 255))
+            draw.text((10, y_offset + i * line_height), line, fill=(180, 255, 180, 255))
         except:
             pass
     
@@ -175,7 +529,7 @@ def create_note_texture(text, width=250, height=200):
     if width > 40 and height > 40:
         draw.ellipse([width-30, height-30, width-5, height-5], fill=(100, 200, 255, 255))
         try:
-            draw.text((width-25, height-25), "✎", fill=(255, 255, 255, 255))
+            draw.text((width-25, height-25), "ÔťÄ", fill=(255, 255, 255, 255))
         except:
             pass
     
@@ -268,8 +622,10 @@ def add_screen_from_path(path, x=0.0, y=0.0):
     """Dodaje PNG jako screen."""
     global screen_counter, texture_counter
 
+    push_undo_state()
+
     if not os.path.exists(path):
-        msg = f"❌ Plik nie istnieje: {path}"
+        msg = f"ÔŁî Plik nie istnieje: {path}"
         print(msg)
         dpg.set_value("result_text", msg)
         return
@@ -300,7 +656,7 @@ def add_screen_from_path(path, x=0.0, y=0.0):
         "mtime": os.path.getmtime(path)
     })
 
-    info = f"✅ PNG: {os.path.basename(path)} ({w}x{h})"
+    info = f"Ôťů PNG: {os.path.basename(path)} ({w}x{h})"
     print(info)
     dpg.set_value("result_text", info)
     redraw_canvas()
@@ -310,8 +666,10 @@ def add_json_to_canvas(path, x=0.0, y=0.0):
     """Dodaje JSON jako graficzny element."""
     global screen_counter, texture_counter
 
+    push_undo_state()
+
     if not os.path.exists(path):
-        msg = f"❌ JSON nie istnieje: {path}"
+        msg = f"ÔŁî JSON nie istnieje: {path}"
         print(msg)
         dpg.set_value("result_text", msg)
         return
@@ -343,15 +701,57 @@ def add_json_to_canvas(path, x=0.0, y=0.0):
         "mtime": os.path.getmtime(path)
     })
 
-    info = f"✅ JSON: {filename}"
+    info = f"Ôťů JSON: {filename}"
     print(info)
     dpg.set_value("result_text", info)
     redraw_canvas()
 
 
+
+
+def update_screen_texture(obj: dict, path: str) -> None:
+    """Podmienia teksture istniejacego screena bez zmiany pozycji."""
+    global texture_counter
+    if not os.path.exists(path):
+        dpg.set_value("result_text", f"Brak pliku PNG: {path}")
+        return
+    image = Image.open(path).convert("RGBA")
+    w, h = image.size
+    raw = np.frombuffer(image.tobytes(), dtype=np.uint8).astype(np.float32) / 255.0
+    data = raw.tolist()
+    old_tex = obj.get("tex")
+    if old_tex and dpg.does_item_exist(old_tex):
+        dpg.delete_item(old_tex)
+    tex_tag = f"tex_reload_{texture_counter}"
+    texture_counter += 1
+    dpg.add_static_texture(w, h, data, tag=tex_tag, parent=TEXREG_TAG)
+    obj.update({"tex": tex_tag, "w": w, "h": h, "path": path, "mtime": os.path.getmtime(path)})
+
+
+def update_json_texture(obj: dict, path: str) -> None:
+    """Podmienia teksture istniejacego JSON-a, zachowujac pozycje/rozmiar."""
+    global texture_counter
+    filename = os.path.basename(path) if path else "missing"
+    width = max(1, int(obj.get("w", 200)))
+    height = max(1, int(obj.get("h", 150)))
+    img = create_json_texture(filename, width=width, height=height)
+    w, h = img.size
+    raw = np.frombuffer(img.tobytes(), dtype=np.uint8).astype(np.float32) / 255.0
+    data = raw.tolist()
+    old_tex = obj.get("tex")
+    if old_tex and dpg.does_item_exist(old_tex):
+        dpg.delete_item(old_tex)
+    tex_tag = f"tex_reload_{texture_counter}"
+    texture_counter += 1
+    dpg.add_static_texture(w, h, data, tag=tex_tag, parent=TEXREG_TAG)
+    mtime = os.path.getmtime(path) if path and os.path.exists(path) else 0.0
+    obj.update({"tex": tex_tag, "w": w, "h": h, "path": path, "mtime": mtime})
+
 def add_note_to_canvas(x=0.0, y=0.0, text="Nowa notatka"):
-    """Dodaje notatkę na canvas."""
+    """Dodaje notatk─Ö na canvas."""
     global screen_counter, texture_counter
+
+    push_undo_state()
 
     img = create_note_texture(text, width=250, height=200)
     w, h = img.size
@@ -378,14 +778,14 @@ def add_note_to_canvas(x=0.0, y=0.0, text="Nowa notatka"):
         "type": "note"
     })
 
-    info = f"✅ Notatka: {text[:20]}..."
+    info = f"Ôťů Notatka: {text[:20]}..."
     print(info)
     dpg.set_value("result_text", info)
     redraw_canvas()
 
 
 def update_note_texture(note):
-    """Aktualizuje teksturę notatki po edycji."""
+    """Aktualizuje tekstur─Ö notatki po edycji."""
     global texture_counter
     
     img = create_note_texture(note["text"], width=int(note["w"]), height=int(note["h"]))
@@ -408,7 +808,7 @@ def update_note_texture(note):
 
 
 def delete_note(note_id):
-    """Usuń notatkę."""
+    """Usu┼ä notatk─Ö."""
     global notes
     
     for i, note in enumerate(notes):
@@ -417,20 +817,20 @@ def delete_note(note_id):
                 dpg.delete_item(note["tex"])
             
             notes.pop(i)
-            print(f"🗑️ Usunięto notatkę: {note['text'][:30]}...")
+            print(f"­čŚĹ´ŞĆ Usuni─Öto notatk─Ö: {note['text'][:30]}...")
             
             if dpg.does_item_exist(NOTE_EDITOR_TAG):
                 dpg.hide_item(NOTE_EDITOR_TAG)
             
             redraw_canvas()
-            dpg.set_value("result_text", "🗑️ Notatka usunięta")
+            dpg.set_value("result_text", "­čŚĹ´ŞĆ Notatka usuni─Öta")
             return
     
-    print(f"❌ Nie znaleziono notatki: {note_id}")
+    print(f"ÔŁî Nie znaleziono notatki: {note_id}")
 
 
 def open_note_editor(note_id):
-    """Otwórz edytor notatki."""
+    """Otw├│rz edytor notatki."""
     global active_note_id
     
     note = None
@@ -453,18 +853,18 @@ def open_note_editor(note_id):
                                multiline=True,
                                width=-1, height=300)
             with dpg.group(horizontal=True):
-                dpg.add_button(label="💾 Zapisz", callback=save_note_edit, width=120)
-                dpg.add_button(label="🗑️ Usuń notatkę", callback=lambda: delete_note(active_note_id), width=120)
-                dpg.add_button(label="❌ Anuluj", callback=lambda: dpg.hide_item(NOTE_EDITOR_TAG), width=120)
+                dpg.add_button(label="­čĺż Zapisz", callback=save_note_edit, width=120)
+                dpg.add_button(label="­čŚĹ´ŞĆ Usu┼ä notatk─Ö", callback=lambda: delete_note(active_note_id), width=120)
+                dpg.add_button(label="ÔŁî Anuluj", callback=lambda: dpg.hide_item(NOTE_EDITOR_TAG), width=120)
     else:
         dpg.configure_item(NOTE_EDITOR_TAG, label=f"Edycja notatki", show=True)
         dpg.set_value(NOTE_TEXT_TAG, note["text"])
     
-    print(f"📝 Edycja notatki: {note_id}")
+    print(f"­čôŁ Edycja notatki: {note_id}")
 
 
 def save_note_edit():
-    """Zapisz edycję notatki."""
+    """Zapisz edycj─Ö notatki."""
     global active_note_id
     
     if not active_note_id:
@@ -476,7 +876,7 @@ def save_note_edit():
         if n["id"] == active_note_id:
             n["text"] = new_text
             update_note_texture(n)
-            print(f"💾 Zaktualizowano notatkę: {new_text[:30]}...")
+            print(f"­čĺż Zaktualizowano notatk─Ö: {new_text[:30]}...")
             break
     
     dpg.hide_item(NOTE_EDITOR_TAG)
@@ -486,7 +886,7 @@ def save_note_edit():
 # ================== HOT RELOAD ==================
 
 def check_and_reload_files():
-    """Sprawdza czy pliki się zmieniły i przeładowuje."""
+    """Sprawdza czy pliki si─Ö zmieni┼éy i prze┼éadowuje."""
     global texture_counter
     
     if not dpg.does_item_exist(CANVAS_TAG):
@@ -502,10 +902,10 @@ def check_and_reload_files():
         try:
             current_mtime = os.path.getmtime(s["path"])
             if current_mtime > s["mtime"]:
-                print(f"🔄 Przeładowuję PNG: {os.path.basename(s['path'])}")
+                print(f"­čöä Prze┼éadowuj─Ö PNG: {os.path.basename(s['path'])}")
                 
                 image = Image.open(s["path"]).convert("RGBA")
-                w, h = image.size
+                tex_w, tex_h = image.size  # pełna rozdzielczość tekstury
                 raw = np.frombuffer(image.tobytes(), dtype=np.uint8).astype(np.float32) / 255.0
                 data = raw.tolist()
                 
@@ -516,18 +916,20 @@ def check_and_reload_files():
                 new_tex_tag = f"tex_reload_{texture_counter}"
                 texture_counter += 1
                 
-                dpg.add_static_texture(w, h, data, tag=new_tex_tag, parent=TEXREG_TAG)
+                dpg.add_static_texture(tex_w, tex_h, data, tag=new_tex_tag, parent=TEXREG_TAG)
                 
                 s["tex"] = new_tex_tag
-                s["w"] = w
-                s["h"] = h
+                # Rozmiar WYŚWIETLANIA – użyj tej samej logiki skalowania co przy pierwszym razie
+                disp_w, disp_h = _default_size_for_image(s["path"])
+                s["w"] = disp_w
+                s["h"] = disp_h
                 s["mtime"] = current_mtime
                 
                 reloaded.append(os.path.basename(s["path"]))
                 needs_redraw = True
                 
         except Exception as e:
-            print(f"❌ Błąd przeładowania PNG {s['path']}: {e}")
+            print(f"ÔŁî B┼é─ůd prze┼éadowania PNG {s['path']}: {e}")
     
     for j in json_objects:
         if not os.path.exists(j["path"]):
@@ -536,7 +938,7 @@ def check_and_reload_files():
         try:
             current_mtime = os.path.getmtime(j["path"])
             if current_mtime > j["mtime"]:
-                print(f"🔄 Przeładowuję JSON: {os.path.basename(j['path'])}")
+                print(f"­čöä Prze┼éadowuj─Ö JSON: {os.path.basename(j['path'])}")
                 
                 filename = os.path.basename(j["path"])
                 img = create_json_texture(filename, width=int(j["w"]), height=int(j["h"]))
@@ -560,37 +962,37 @@ def check_and_reload_files():
                 needs_redraw = True
                 
         except Exception as e:
-            print(f"❌ Błąd przeładowania JSON {j['path']}: {e}")
+            print(f"ÔŁî B┼é─ůd prze┼éadowania JSON {j['path']}: {e}")
     
     if needs_redraw:
         redraw_canvas()
-        msg = f"🔄 Odświeżono: {', '.join(reloaded)}"
+        msg = f"­čöä Od┼Ťwie┼╝ono: {', '.join(reloaded)}"
         dpg.set_value("result_text", msg)
 
 
 def auto_reload_thread():
-    """Wątek sprawdzający zmiany."""
+    """W─ůtek sprawdzaj─ůcy zmiany."""
     while True:
         time.sleep(AUTO_RELOAD_INTERVAL)
         if auto_reload_enabled:
             try:
                 check_and_reload_files()
             except Exception as e:
-                print(f"❌ Błąd auto-reload: {e}")
+                print(f"ÔŁî B┼é─ůd auto-reload: {e}")
 
 
 def toggle_auto_reload():
-    """Przełącz auto-reload."""
+    """Prze┼é─ůcz auto-reload."""
     global auto_reload_enabled
     auto_reload_enabled = not auto_reload_enabled
     status = "ON" if auto_reload_enabled else "OFF"
     color = (100, 255, 100) if auto_reload_enabled else (255, 100, 100)
     dpg.configure_item("auto_reload_status", default_value=f"Auto: {status}", color=color)
-    print(f"🔄 Auto-reload: {status}")
+    print(f"­čöä Auto-reload: {status}")
 
 
 def open_json_viewer(path):
-    """Otwórz viewer JSON."""
+    """Otw├│rz viewer JSON."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             content = f.read()
@@ -600,7 +1002,7 @@ def open_json_viewer(path):
         except:
             pretty = content
     except Exception as e:
-        pretty = f"❌ Błąd: {e}"
+        pretty = f"ÔŁî B┼é─ůd: {e}"
 
     title = f"JSON: {os.path.basename(path)}"
 
@@ -612,10 +1014,100 @@ def open_json_viewer(path):
         dpg.configure_item(JSON_VIEWER_TAG, label=title, show=True)
         dpg.set_value(JSON_TEXT_TAG, pretty)
     
-    print(f"📖 Otwarto JSON: {os.path.basename(path)}")
+    print(f"­čôľ Otwarto JSON: {os.path.basename(path)}")
 
 
 # ================== ZAPIS/ODCZYT ==================
+
+def _clear_all_objects():
+    """Usuń istniejące obiekty i powiązane tekstury (przed wczytaniem stanu)."""
+    global screens, json_objects, notes, lines, screen_counter, texture_counter
+    for obj in screens + json_objects + notes:
+        tex = obj.get("tex")
+        if tex and dpg.does_item_exist(tex):
+            with contextlib.suppress(Exception):
+                dpg.delete_item(tex)
+    screens = []
+    json_objects = []
+    notes = []
+    lines = []
+    screen_counter = 0
+    texture_counter = 0
+
+
+def _delete_texture_for(obj: dict):
+    tex = obj.get("tex")
+    if tex and dpg.does_item_exist(tex):
+        with contextlib.suppress(Exception):
+            dpg.delete_item(tex)
+
+
+def apply_state(state: dict):
+    """Załaduj stan (screens/json/notes/lines) na canvas."""
+    global pan_x, pan_y, zoom, lines
+    _clear_all_objects()
+
+    pan_x = float(state.get("pan_x", 0.0))
+    pan_y = float(state.get("pan_y", 0.0))
+    zoom = max(0.1, min(5.0, float(state.get("zoom", 1.0))))
+
+    for s in state.get("screens", []):
+        path = s.get("path")
+        if path and os.path.exists(path):
+            add_screen_from_path(path, x=float(s.get("x", 0.0)), y=float(s.get("y", 0.0)))
+            screens[-1]["w"] = float(s.get("w", screens[-1]["w"]))
+            screens[-1]["h"] = float(s.get("h", screens[-1]["h"]))
+
+    for j in state.get("json_objects", []):
+        path = j.get("path")
+        if path and os.path.exists(path):
+            add_json_to_canvas(path, x=float(j.get("x", 0.0)), y=float(j.get("y", 0.0)))
+            json_objects[-1]["w"] = float(j.get("w", json_objects[-1]["w"]))
+            json_objects[-1]["h"] = float(j.get("h", json_objects[-1]["h"]))
+
+    for n in state.get("notes", []):
+        text = n.get("text", "")
+        add_note_to_canvas(x=float(n.get("x", 0.0)), y=float(n.get("y", 0.0)), text=text)
+        notes[-1]["w"] = float(n.get("w", notes[-1]["w"]))
+        notes[-1]["h"] = float(n.get("h", notes[-1]["h"]))
+
+    for ln in state.get("lines", []):
+        if all(k in ln for k in ("x1", "y1", "x2", "y2")):
+            lines.append(
+                {"x1": float(ln["x1"]), "y1": float(ln["y1"]), "x2": float(ln["x2"]), "y2": float(ln["y2"])}
+            )
+
+    redraw_canvas()
+
+
+def capture_state_snapshot() -> dict:
+    """Aktualny stan canvasu (do undo/zapisu)."""
+    return {
+        "pan_x": pan_x,
+        "pan_y": pan_y,
+        "zoom": zoom,
+        "screens": [{"path": s["path"], "x": s["x"], "y": s["y"], "w": s["w"], "h": s["h"]} for s in screens],
+        "json_objects": [{"path": j["path"], "x": j["x"], "y": j["y"], "w": j["w"], "h": j["h"]} for j in json_objects],
+        "notes": [{"text": n["text"], "x": n["x"], "y": n["y"], "w": n["w"], "h": n["h"]} for n in notes],
+        "lines": [{"x1": ln["x1"], "y1": ln["y1"], "x2": ln["x2"], "y2": ln["y2"]} for ln in lines],
+    }
+
+
+def push_undo_state():
+    """Zachowaj stan do undo."""
+    try:
+        snapshot = capture_state_snapshot()
+    except Exception:
+        return
+    undo_stack.append(snapshot)
+    if len(undo_stack) > UNDO_LIMIT:
+        undo_stack.pop(0)
+
+
+def restore_state(snapshot: dict):
+    """Przywróć stan (undo)."""
+    apply_state(snapshot)
+
 
 def save_state():
     """Zapisz stan."""
@@ -631,9 +1123,9 @@ def save_state():
         }
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             pyjson.dump(state, f, ensure_ascii=False, indent=2)
-        print(f"💾 Stan zapisany")
+        print(f"­čĺż Stan zapisany")
     except Exception as e:
-        print(f"❌ Błąd zapisu: {e}")
+        print(f"ÔŁî B┼é─ůd zapisu: {e}")
 
 
 def load_state():
@@ -647,7 +1139,7 @@ def load_state():
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             state = pyjson.load(f)
     except Exception as e:
-        print(f"❌ Błąd odczytu: {e}")
+        print(f"ÔŁî B┼é─ůd odczytu: {e}")
         return False
 
     pan_x = float(state.get("pan_x", 0.0))
@@ -680,14 +1172,257 @@ def load_state():
                          "x2": float(ln["x2"]), "y2": float(ln["y2"])})
 
     redraw_canvas()
-    print("📂 Stan wczytany")
+    print("­čôé Stan wczytany")
     return True
+
+
+def load_state_pipeline() -> bool:
+    """Najpierw spróbuj wczytać stan, jeśli brak – zbuduj pipeline z artefaktów *_current."""
+    try:
+        if load_state():
+            return True
+    except Exception:
+        pass
+    try:
+        pipeline_state = build_pipeline_state()
+        apply_state(pipeline_state)
+        save_state()
+        print("╞��c Zainicjalizowano widok pipeline (current*)")
+        return True
+    except Exception as e:
+        print(f"�ʼ� Błąd inicjalizacji pipeline: {e}")
+        return False
 
 
 def on_exit():
     save_state()
 
 
+# ================== BACKUP / PIPELINE RUNS ==================
+
+
+def _format_run_label(run: Path) -> str:
+    """Zwraca etykietę runu z czasem modyfikacji i wiekiem."""
+    ts = run.stat().st_mtime
+    ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+    delta = max(0.0, time.time() - ts)
+    if delta < 90:
+        human = f"{int(delta)}s ago"
+    elif delta < 3600:
+        human = f"{int(delta // 60)}m ago"
+    elif delta < 86400:
+        hours = int(delta // 3600)
+        minutes = int((delta % 3600) // 60)
+        human = f"{hours}h {minutes}m ago"
+    else:
+        days = int(delta // 86400)
+        hours = int((delta % 86400) // 3600)
+        human = f"{days}d {hours}h ago"
+    return f"{ts_str} ({human}) | {run.name}"
+
+
+def _update_backup_list():
+    """Buduje widok backupow w formie drzewa (dzien -> godzina -> minuta -> sekundy)."""
+    if not dpg.does_item_exist(PIPELINE_LIST_TAG):
+        return
+
+    # Wyczysc kontener drzewa
+    if dpg.does_item_exist(PIPELINE_LIST_TAG):
+        dpg.delete_item(PIPELINE_LIST_TAG, children_only=True)
+
+    if not pipeline_runs:
+        if dpg.does_item_exist(PIPELINE_STATUS_TAG):
+            dpg.set_value(PIPELINE_STATUS_TAG, "Brak zapisanych runow")
+        dpg.add_text("Brak zapisanych runow", parent=PIPELINE_LIST_TAG)
+        return
+
+    # Metadane z czasem
+    runs_meta = pipeline_runs_meta or []
+    if not runs_meta:
+        for idx, run in enumerate(pipeline_runs):
+            try:
+                ts = run.stat().st_mtime
+            except Exception:
+                continue
+            runs_meta.append((idx, run, ts))
+
+    # Sort desc
+    runs_meta.sort(key=lambda x: x[2], reverse=True)
+
+    # Grupowanie po dacie (max MAX_BACKUP_DAYS)
+    day_groups = {}
+    day_order = []
+    for idx, run, ts in runs_meta:
+        tm = time.localtime(ts)
+        day_key = time.strftime("%Y-%m-%d", tm)
+        if day_key not in day_groups and len(day_groups) >= MAX_BACKUP_DAYS:
+            continue
+        day_groups.setdefault(day_key, []).append((idx, run, tm))
+        if day_key not in day_order:
+            day_order.append(day_key)
+
+    tree_root = dpg.add_tree_node(label="Ostatnie backupy", default_open=True, parent=PIPELINE_LIST_TAG, tag=PIPELINE_TREE_TAG)
+
+    for day_key in day_order:
+        entries = day_groups.get(day_key, [])
+        # sort per day desc
+        entries.sort(key=lambda x: time.mktime(x[2]), reverse=True)
+        if not entries:
+            continue
+        tm0 = entries[0][2]
+        weekday = POLISH_DAY_NAMES[tm0.tm_wday] if 0 <= tm0.tm_wday < 7 else day_key
+        day_label = f"{weekday} ({day_key})"
+        day_node = dpg.add_tree_node(label=day_label, default_open=False, parent=tree_root)
+
+        # hour -> minute -> runs
+        hour_groups = {}
+        for idx, run, tm in entries:
+            hour_groups.setdefault(tm.tm_hour, []).append((idx, run, tm))
+        for hour, hour_entries in sorted(hour_groups.items(), key=lambda x: x[0], reverse=True):
+            hour_label = f"{hour:02d}:00"
+            hour_node = dpg.add_tree_node(label=hour_label, default_open=False, parent=day_node)
+
+            minute_groups = {}
+            for idx, run, tm in hour_entries:
+                minute_groups.setdefault(tm.tm_min, []).append((idx, run, tm))
+            for minute, minute_entries in sorted(minute_groups.items(), key=lambda x: x[0], reverse=True):
+                minute_label = f"{hour:02d}:{minute:02d}"
+                minute_node = dpg.add_tree_node(label=minute_label, default_open=False, parent=hour_node)
+
+                for idx, run, tm in sorted(minute_entries, key=lambda x: x[2].tm_sec, reverse=True):
+                    sec_label = f"{hour:02d}:{minute:02d}:{tm.tm_sec:02d} | {run.name}"
+                    dpg.add_selectable(label=sec_label, callback=on_backup_run_click, user_data=idx, parent=minute_node)
+
+    if dpg.does_item_exist(PIPELINE_STATUS_TAG):
+        dpg.set_value(PIPELINE_STATUS_TAG, f"{len(pipeline_runs)} runs (ostatnie {len(day_order)} dni)")
+
+
+def refresh_pipeline_runs():
+    """Zbiera katalogi z backupami pipeline."""
+    global pipeline_runs, pipeline_run_index, pipeline_runs_meta
+    runs = []
+    meta = []
+    if PIPELINE_RUNS_DIR.exists():
+        try:
+            for entry in os.scandir(PIPELINE_RUNS_DIR):
+                if entry.is_dir():
+                    p = Path(entry.path)
+                    ts = entry.stat().st_mtime
+                    runs.append(p)
+                    meta.append((len(meta), p, ts))
+        except Exception:
+            runs = [p for p in PIPELINE_RUNS_DIR.iterdir() if p.is_dir()]
+            meta = []
+            for idx, p in enumerate(runs):
+                try:
+                    meta.append((idx, p, p.stat().st_mtime))
+                except Exception:
+                    pass
+    runs_sorted = sorted(meta, key=lambda x: x[2], reverse=True)
+    pipeline_runs = [r for _, r, _ in runs_sorted]
+    pipeline_runs_meta = [(idx, r, ts) for idx, (_, r, ts) in enumerate(runs_sorted)] if runs_sorted else []
+    if pipeline_runs:
+        pipeline_run_index = min(pipeline_run_index, len(pipeline_runs) - 1)
+    else:
+        pipeline_run_index = 0
+    _update_backup_list()
+
+
+def clear_canvas_objects():
+    """Czysci wszystkie obiekty i tekstury z canvasa."""
+    global screens, json_objects, notes, lines
+    global screen_counter, texture_counter, active_object_id, active_note_id
+    for obj in screens + json_objects + notes:
+        tex = obj.get("tex")
+        if tex and dpg.does_item_exist(tex):
+            dpg.delete_item(tex)
+    screens = []
+    json_objects = []
+    notes = []
+    lines = []
+    screen_counter = 0
+    texture_counter = 0
+    active_object_id = None
+    active_note_id = None
+    if dpg.does_item_exist(CANVAS_TAG):
+        dpg.delete_item(CANVAS_TAG, children_only=True)
+    redraw_canvas()
+
+
+def load_pipeline_run(target_index: int = 0):
+    """Laduje PNG + JSON z wybranego runu (0 = najnowszy)."""
+    global pipeline_run_index
+    refresh_pipeline_runs()
+    if not pipeline_runs:
+        dpg.set_value("result_text", "Brak zapisanych runow.")
+        return
+    pipeline_run_index = max(0, min(target_index, len(pipeline_runs) - 1))
+    _update_backup_list()
+    run_dir = pipeline_runs[pipeline_run_index]
+
+    screenshot = run_dir / "screenshot.png"
+    region_json = run_dir / "region_grow.json"
+    summary_json = run_dir / "summary.json"
+    rating_json = run_dir / "rating.json"
+
+    if screenshot.exists():
+        if screens:
+            update_screen_texture(screens[0], str(screenshot))
+        else:
+            add_screen_from_path(str(screenshot), x=0.0, y=0.0)
+
+    target_jsons = []
+    if region_json.exists():
+        target_jsons.append(region_json)
+    target_summary = summary_json if summary_json.exists() else None
+    if not target_summary and rating_json.exists():
+        target_summary = rating_json
+    if target_summary:
+        target_jsons.append(target_summary)
+
+    for idx, jpath in enumerate(target_jsons):
+        if idx < len(json_objects):
+            update_json_texture(json_objects[idx], str(jpath))
+        else:
+            add_json_to_canvas(str(jpath), x=0.0, y=0.0)
+
+    if len(json_objects) > len(target_jsons):
+        for idx in range(len(target_jsons), len(json_objects)):
+            update_json_texture(json_objects[idx], "")
+
+    dpg.set_value("result_text", f"Wczytano run: {run_dir.name}")
+    redraw_canvas()
+
+
+def on_backup_select(sender, app_data):
+    """Wybor elementu z listy backupow."""
+    # zachowane dla zgodnosci (listbox juz nieuzywany)
+    if isinstance(app_data, int):
+        load_pipeline_run(app_data)
+
+
+def toggle_backup_window():
+    """Pokazuje/ukrywa okno backupów."""
+    if not dpg.does_item_exist(BACKUP_WINDOW_TAG):
+        return
+    visible = dpg.is_item_shown(BACKUP_WINDOW_TAG)
+    if visible:
+        dpg.hide_item(BACKUP_WINDOW_TAG)
+    else:
+        refresh_pipeline_runs()
+        dpg.configure_item(BACKUP_WINDOW_TAG, show=True, on_top=True)
+
+
+def on_backup_run_click(sender, app_data, user_data):
+    """Klik w konkretny run w drzewie."""
+    try:
+        idx = int(user_data)
+    except Exception:
+        return
+    load_pipeline_run(idx)
+
+
+# ================== CALLBACKI ==================
 # ================== CALLBACKI ==================
 
 def get_all_objects():
@@ -703,15 +1438,24 @@ def on_file_dialog(sender, app_data):
 
     lower = path.lower()
     if lower.endswith(".png"):
-        add_screen_from_path(path)
+        spawn_x, spawn_y = default_spawn_coords()
+        add_screen_from_path(path, x=spawn_x, y=spawn_y)
     elif lower.endswith(".json"):
-        add_json_to_canvas(path)
+        spawn_x, spawn_y = default_spawn_coords()
+        add_json_to_canvas(path, x=spawn_x, y=spawn_y)
     else:
-        dpg.set_value("result_text", f"Nieobsługiwany typ: {path}")
-
+        dpg.set_value("result_text", f"Nieobs?ugiwany typ: {path}")
 
 def on_file_button():
-    dpg.show_item("file_dialog_id")
+    # Pokaż dialog plików jako okno modalne i ustaw go na wierzchu.
+    try:
+        dpg.configure_item(FILE_DIALOG_TAG, show=True, modal=True)
+    except Exception:
+        dpg.configure_item(FILE_DIALOG_TAG, show=True)
+    try:
+        dpg.focus_item(FILE_DIALOG_TAG)
+    except Exception:
+        pass
 
 
 def on_key_d(sender, app_data):
@@ -729,7 +1473,7 @@ def on_key_d(sender, app_data):
     line_start = None
     mode = "ON" if draw_line_mode else "OFF"
     dpg.set_value("mode_text", f"Tryb linii (D): {mode}")
-    print(f"🖊️ Rysowanie: {mode}")
+    print(f"­čľŐ´ŞĆ Rysowanie: {mode}")
     redraw_canvas()
 
 
@@ -748,7 +1492,7 @@ def on_key_c(sender, app_data):
     erase_mode = not erase_mode
     mode = "ON" if erase_mode else "OFF"
     dpg.set_value("erase_text", f"Gumka (C): {mode}")
-    print(f"🧹 Gumka: {mode}")
+    print(f"­čž╣ Gumka: {mode}")
     redraw_canvas()
 
 
@@ -768,8 +1512,23 @@ def on_key_n(sender, app_data):
     add_note_mode = not add_note_mode
     mode = "ON" if add_note_mode else "OFF"
     dpg.set_value("note_text", f"Notatka (N): {mode}")
-    print(f"📝 Dodawanie notatki: {mode}")
+    print(f"?? Dodawanie notatki: {mode}")
 
+
+def on_key_z(sender, app_data):
+    """Undo (Ctrl+Z)."""
+    if not dpg.is_key_down(dpg.mvKey_Control):
+        return
+    if not undo_stack:
+        return
+    snapshot = undo_stack.pop()
+    restore_state(snapshot)
+    dpg.set_value("result_text", "Cofnieto (Ctrl+Z)")
+
+
+def on_key_b(sender, app_data):
+    """Toggle okna backup?w (lista runow)."""
+    toggle_backup_window()
 
 def on_left_click(sender, app_data):
     global active_object_id, drag_offset
@@ -778,10 +1537,11 @@ def on_left_click(sender, app_data):
 
     mx, my = dpg.get_mouse_pos()
     wx, wy = world_from_screen(mx, my)
+    push_undo_state()
 
     # PRIORYTET 0: Dodawanie notatki
     if add_note_mode:
-        add_note_to_canvas(x=wx, y=wy, text="Nowa notatka\nKliknij dwukrotnie aby edytować")
+        add_note_to_canvas(x=wx, y=wy, text="Nowa notatka\nKliknij dwukrotnie aby edytowa─ç")
         add_note_mode = False
         dpg.set_value("note_text", "Notatka (N): OFF")
         return
@@ -797,12 +1557,37 @@ def on_left_click(sender, app_data):
             
             if dist_screen <= ERASE_DISTANCE_PX:
                 removed = lines.pop(i)
-                print(f"🗑️ Usunięto linię")
+                print(f"­čŚĹ´ŞĆ Usuni─Öto lini─Ö")
                 removed_count += 1
             else:
                 i += 1
+
+        # Usuń screeny (PNG) pod kursorem
+        for idx in range(len(screens) - 1, -1, -1):
+            s = screens[idx]
+            sx, sy, sw, sh = s["x"], s["y"], s["w"], s["h"]
+            inside = sx <= wx <= sx + sw and sy <= wy <= sy + sh
+            if inside:
+                _delete_texture_for(s)
+                screens.pop(idx)
+                removed_count += 1
+                print("🧽 Usunięto screen (gumka).")
+                break
+
+        # Usuń JSON (tekstura podglądu) pod kursorem
+        for idx in range(len(json_objects) - 1, -1, -1):
+            j = json_objects[idx]
+            sx, sy, sw, sh = j["x"], j["y"], j["w"], j["h"]
+            inside = sx <= wx <= sx + sw and sy <= wy <= sy + sh
+            if inside:
+                _delete_texture_for(j)
+                json_objects.pop(idx)
+                removed_count += 1
+                print("🧽 Usunięto JSON (gumka).")
+                break
         
         if removed_count > 0:
+            dpg.set_value("result_text", f"Usunięto obiekty: {removed_count}")
             redraw_canvas()
         return
 
@@ -824,23 +1609,23 @@ def on_left_click(sender, app_data):
     resize_edge_bottom = False
     needs_texture_update = False
 
-    # Większy margines dla lepszego wykrywania
+    # Wi─Ökszy margines dla lepszego wykrywania
     RESIZE_MARGIN_WORLD = 20 / max(zoom, 0.001)  # 20 pikseli w world units
 
     all_objs = get_all_objects()
     for obj in reversed(all_objs):
         sx, sy, sw, sh = obj["x"], obj["y"], obj["w"], obj["h"]
         
-        # Sprawdź czy jesteśmy blisko prawej krawędzi
+        # Sprawd┼║ czy jeste┼Ťmy blisko prawej kraw─Ödzi
         near_right = abs(wx - (sx + sw)) <= RESIZE_MARGIN_WORLD
-        # Sprawdź czy jesteśmy blisko dolnej krawędzi
+        # Sprawd┼║ czy jeste┼Ťmy blisko dolnej kraw─Ödzi
         near_bottom = abs(wy - (sy + sh)) <= RESIZE_MARGIN_WORLD
         
-        # Sprawdź czy jesteśmy w obszarze obiektu (z marginesem resize)
+        # Sprawd┼║ czy jeste┼Ťmy w obszarze obiektu (z marginesem resize)
         in_x_range = (sx - RESIZE_MARGIN_WORLD) <= wx <= (sx + sw + RESIZE_MARGIN_WORLD)
         in_y_range = (sy - RESIZE_MARGIN_WORLD) <= wy <= (sy + sh + RESIZE_MARGIN_WORLD)
         
-        # Jeśli jesteśmy blisko krawędzi i w zakresie obiektu
+        # Je┼Ťli jeste┼Ťmy blisko kraw─Ödzi i w zakresie obiektu
         if in_x_range and in_y_range and (near_right or near_bottom):
             resize_mode = True
             resize_object_id = obj["id"]
@@ -848,25 +1633,25 @@ def on_left_click(sender, app_data):
             resize_edge_bottom = near_bottom
             
             # Debug
-            print(f"🔧 RESIZE MODE: {obj['id']}")
+            print(f"­čöž RESIZE MODE: {obj['id']}")
             print(f"   Pozycja myszy: wx={wx:.1f}, wy={wy:.1f}")
             print(f"   Obiekt: x={sx:.1f}, y={sy:.1f}, w={sw:.1f}, h={sh:.1f}")
-            print(f"   Prawa krawędź: {sx + sw:.1f}, odległość: {abs(wx - (sx + sw)):.1f}")
-            print(f"   Dolna krawędź: {sy + sh:.1f}, odległość: {abs(wy - (sy + sh)):.1f}")
+            print(f"   Prawa kraw─Öd┼║: {sx + sw:.1f}, odleg┼éo┼Ť─ç: {abs(wx - (sx + sw)):.1f}")
+            print(f"   Dolna kraw─Öd┼║: {sy + sh:.1f}, odleg┼éo┼Ť─ç: {abs(wy - (sy + sh)):.1f}")
             print(f"   Resize RIGHT: {resize_edge_right}, BOTTOM: {resize_edge_bottom}")
             print(f"   Margin: {RESIZE_MARGIN_WORLD:.1f}")
             
-            dpg.set_value("result_text", f"🔧 Resize: {'prawo' if near_right else ''} {'dół' if near_bottom else ''}")
+            dpg.set_value("result_text", f"­čöž Resize: {'prawo' if near_right else ''} {'d├│┼é' if near_bottom else ''}")
             return
 
-        # Sprawdź czy kliknięto WEWNĄTRZ obiektu (dla drag)
+        # Sprawd┼║ czy klikni─Öto WEWN─äTRZ obiektu (dla drag)
         inside = sx <= wx <= sx + sw and sy <= wy <= sy + sh
         
         if inside:
             active_object_id = obj["id"]
             drag_offset = (wx - sx, wy - sy)
-            print(f"✋ DRAG MODE: {obj['id']}")
-            dpg.set_value("result_text", f"✋ Przeciąganie: {obj['id']}")
+            print(f"Ôťő DRAG MODE: {obj['id']}")
+            dpg.set_value("result_text", f"Ôťő Przeci─ůganie: {obj['id']}")
             return
 
 
@@ -920,21 +1705,21 @@ def on_left_drag(sender, app_data):
                 old_w = obj["w"]
                 old_h = obj["h"]
                 
-                # Aktualizuj szerokość
+                # Aktualizuj szeroko┼Ť─ç
                 if resize_edge_right:
                     new_w = max(MIN_SIZE, wx - obj["x"])
                     obj["w"] = new_w
                 
-                # Aktualizuj wysokość
+                # Aktualizuj wysoko┼Ť─ç
                 if resize_edge_bottom:
                     new_h = max(MIN_SIZE, wy - obj["y"])
                     obj["h"] = new_h
                 
-                # Debug - pokaż co się zmienia
+                # Debug - poka┼╝ co si─Ö zmienia
                 if obj["w"] != old_w or obj["h"] != old_h:
-                    print(f"📏 Resize: {old_w:.0f}x{old_h:.0f} -> {obj['w']:.0f}x{obj['h']:.0f}")
+                    print(f"­čôĆ Resize: {old_w:.0f}x{old_h:.0f} -> {obj['w']:.0f}x{obj['h']:.0f}")
                 
-                # Oznacz że trzeba zaktualizować teksturę notatki
+                # Oznacz ┼╝e trzeba zaktualizowa─ç tekstur─Ö notatki
                 if obj["type"] == "note":
                     needs_texture_update = True
                 
@@ -985,6 +1770,36 @@ def on_middle_release(sender, app_data):
 def on_mouse_wheel(sender, app_data):
     global zoom, pan_x, pan_y
 
+    # Zoom działa TYLKO gdy kursor jest nad canvasem,
+    # i NIE działa nad oknami dialogowymi (backup, file dialog).
+    try:
+        mx, my = dpg.get_mouse_pos()
+
+        # 1) Jeśli mysz nie jest nad canvasem -> żadnego zoomu.
+        if dpg.does_item_exist(CANVAS_TAG):
+            try:
+                c_min_x, c_min_y = dpg.get_item_rect_min(CANVAS_TAG)
+                c_max_x, c_max_y = dpg.get_item_rect_max(CANVAS_TAG)
+                if not (c_min_x <= mx <= c_max_x and c_min_y <= my <= c_max_y):
+                    return
+            except Exception:
+                # Gdyby pobranie recta się wywaliło, zachowaj się konserwatywnie.
+                return
+
+        # 2) Jeżeli kursor jest na oknie backupów lub file dialogu -> też blokuj zoom.
+        for overlay in (BACKUP_WINDOW_TAG, FILE_DIALOG_TAG):
+            if not dpg.does_item_exist(overlay):
+                continue
+            try:
+                min_x, min_y = dpg.get_item_rect_min(overlay)
+                max_x, max_y = dpg.get_item_rect_max(overlay)
+            except Exception:
+                continue
+            if min_x <= mx <= max_x and min_y <= my <= max_y:
+                return
+    except Exception:
+        pass
+
     delta = app_data
     if delta == 0:
         return
@@ -1006,6 +1821,39 @@ def on_mouse_move(sender, app_data):
         redraw_canvas()
 
 
+def on_viewport_resize(sender, app_data):
+    """Dopasuj okno i canvas do aktualnego rozmiaru viewportu (fullscreen)."""
+    try:
+        width, height = app_data
+    except Exception:
+        # Fallback, gdy DearPyGui zwraca inne dane
+        try:
+            width = dpg.get_viewport_client_width()
+            height = dpg.get_viewport_client_height()
+        except Exception:
+            width = dpg.get_viewport_width()
+            height = dpg.get_viewport_height()
+
+    # Rozmiar głównego okna
+    try:
+        dpg.set_item_width(WINDOW_TAG, width)
+        dpg.set_item_height(WINDOW_TAG, height)
+    except Exception:
+        pass
+
+    # Zostaw trochę miejsca na toolbar u góry
+    canvas_margin_x = 20
+    canvas_margin_top = 150
+    canvas_width = max(200, width - 2 * canvas_margin_x)
+    canvas_height = max(200, height - canvas_margin_top - 20)
+
+    try:
+        dpg.set_item_width(CANVAS_TAG, canvas_width)
+        dpg.set_item_height(CANVAS_TAG, canvas_height)
+    except Exception:
+        pass
+
+
 # ================== UI ==================
 
 dpg.create_context()
@@ -1013,13 +1861,13 @@ dpg.create_context()
 with dpg.texture_registry(tag=TEXREG_TAG):
     pass
 
-with dpg.window(label="Flow GUI", tag=WINDOW_TAG, width=1200, height=800):
-    dpg.add_text("🗺️ Canvas: PNG + JSON + Notatki + Linie + Pan/Zoom + Gumka")
+with dpg.window(label="Flow GUI", tag=WINDOW_TAG, width=1200, height=800, pos=(0, 0)):
+    dpg.add_text("­čŚ║´ŞĆ Canvas: PNG + JSON + Notatki + Linie + Pan/Zoom + Gumka")
 
     with dpg.group(horizontal=True):
-        dpg.add_button(label="📁 Dodaj PNG/JSON", callback=on_file_button)
-        dpg.add_button(label="🔄 Odśwież", callback=lambda: check_and_reload_files())
-        dpg.add_button(label="⏯️", callback=toggle_auto_reload, width=30)
+        dpg.add_button(label="­čôü Dodaj PNG/JSON", callback=on_file_button)
+        dpg.add_button(label="­čöä Od┼Ťwie┼╝", callback=lambda: check_and_reload_files())
+        dpg.add_button(label="ÔĆ»´ŞĆ", callback=toggle_auto_reload, width=30)
         dpg.add_text("Auto: ON", tag="auto_reload_status", color=(100, 255, 100))
         dpg.add_text("Gotowy", tag="result_text")
 
@@ -1031,11 +1879,12 @@ with dpg.window(label="Flow GUI", tag=WINDOW_TAG, width=1200, height=800):
         dpg.add_text("Notatka (N): OFF", tag="note_text")
 
     dpg.add_separator()
-    dpg.add_text("LPM: drag/resize | DWUKLIK: edytuj notatkę/JSON | PPM: pan | Scroll: zoom")
-    dpg.add_text("D: rysuj linie | C: gumka | N: dodaj notatkę (kliknij gdzie ma być)")
+    dpg.add_text("LPM: drag/resize | DWUKLIK: edytuj notatk─Ö/JSON | PPM: pan | Scroll: zoom")
+    dpg.add_text("D: rysuj linie | C: gumka | N: dodaj notatk─Ö (kliknij gdzie ma by─ç)")
     dpg.add_separator()
 
-    dpg.add_drawlist(width=1100, height=550, tag=CANVAS_TAG)
+    # Rozmiar zostanie nadpisany w on_viewport_resize, tu tylko startowe wartości
+    dpg.add_drawlist(width=1200, height=650, tag=CANVAS_TAG)
 
 with dpg.file_dialog(
     directory_selector=False,
@@ -1048,6 +1897,12 @@ with dpg.file_dialog(
     dpg.add_file_extension(".*", color=(200, 200, 200, 255))
     dpg.add_file_extension(".png", color=(150, 255, 150, 255))
     dpg.add_file_extension(".json", color=(255, 200, 0, 255))
+
+with dpg.window(label="Backups (B)", tag=BACKUP_WINDOW_TAG, width=500, height=320, show=False):
+    dpg.add_text("Runs: brak", tag=PIPELINE_STATUS_TAG)
+    dpg.add_child_window(tag=PIPELINE_LIST_TAG, width=-1, height=250, border=True)
+    dpg.add_button(label="Odswiez liste", callback=refresh_pipeline_runs)
+
 
 with dpg.handler_registry():
     dpg.add_mouse_click_handler(button=0, callback=on_left_click)
@@ -1065,16 +1920,32 @@ with dpg.handler_registry():
     dpg.add_key_press_handler(key=dpg.mvKey_D, callback=on_key_d)
     dpg.add_key_press_handler(key=dpg.mvKey_C, callback=on_key_c)
     dpg.add_key_press_handler(key=dpg.mvKey_N, callback=on_key_n)
+    dpg.add_key_press_handler(key=dpg.mvKey_Z, callback=on_key_z)
+    dpg.add_key_press_handler(key=dpg.mvKey_B, callback=on_key_b)
 
-dpg.create_viewport(title="Flow UI - Canvas", width=1200, height=800)
+dpg.create_viewport(title="Flow UI - Canvas", width=1280, height=720)
 dpg.setup_dearpygui()
 dpg.show_viewport()
+with contextlib.suppress(Exception):
+    dpg.set_viewport_resize_callback(on_viewport_resize)
+with contextlib.suppress(Exception):
+    dpg.maximize_viewport()
+    try:
+        vw = dpg.get_viewport_client_width()
+        vh = dpg.get_viewport_client_height()
+    except Exception:
+        vw = dpg.get_viewport_width()
+        vh = dpg.get_viewport_height()
+    on_viewport_resize(None, (vw, vh))
+
 dpg.set_exit_callback(on_exit)
 
-if not load_state():
-    default_image_path = r"E:\BOT ANK\bot\moje_AI\yolov8\FULL BOT\dom_live\debug\ocr_strip1_active.png"
+if not load_state_pipeline():
+    default_image_path = str(DEBUG_SCREEN_DIR / "ocr_strip1_active.png")
     if os.path.exists(default_image_path):
         add_screen_from_path(default_image_path, x=0.0, y=0.0)
+
+refresh_pipeline_runs()
 
 reload_thread = threading.Thread(target=auto_reload_thread, daemon=True)
 reload_thread.start()
@@ -1082,7 +1953,7 @@ reload_thread.start()
 try:
     dpg.start_dearpygui()
 except KeyboardInterrupt:
-    print("\n⚠️ Ctrl+C")
+    print("\nÔÜá´ŞĆ Ctrl+C")
     save_state()
 finally:
     dpg.destroy_context()

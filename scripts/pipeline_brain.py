@@ -15,7 +15,7 @@ from typing import Any, Dict, Optional
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_SCREEN_DIR = ROOT / "data" / "screen"
-RATE_SUMMARY_DIR = DATA_SCREEN_DIR / "numpy_points" / "rate_summary"
+RATE_SUMMARY_DIR = DATA_SCREEN_DIR / "rate" / "rate_summary"
 DOM_LIVE_DIR = ROOT / "dom_live"
 DEFAULT_BRAIN_STATE = DATA_SCREEN_DIR / "brain_state.json"
 
@@ -69,6 +69,7 @@ def build_brain_state(
         next_clicked = True
 
     top_labels = (summary_data or {}).get("top_labels") or {}
+    background_layout = (summary_data or {}).get("background_layout") or {}
     answers = []
     for key in ("answer_single", "answer_multi"):
         if key in top_labels:
@@ -79,17 +80,58 @@ def build_brain_state(
             next_candidate = top_labels[key]
             break
 
-    cookies_candidate = top_labels.get("cookie_accept") or top_labels.get("cookie_reject")
+    # Preferuj wyłącznie przycisk akceptacji cookies – nie klikamy „reject”.
+    cookies_candidate = top_labels.get("cookie_accept")
 
     has_answers = bool(answers)
     has_next = next_candidate is not None
+    need_scroll = not has_answers and not has_next
 
-    if has_answers and not answer_clicked:
+    # Priorytet: najpierw cookies -> potem odpowiedź -> Next -> scroll.
+    if cookies_candidate is not None:
+        recommended = "click_cookies_accept"
+    elif has_answers and not answer_clicked:
         recommended = "click_answer"
     elif has_next and answer_clicked and not next_clicked:
         recommended = "click_next"
+    elif need_scroll:
+        # Brak odpowiedzi i przycisku Next w aktualnym summary:
+        # spróbuj przewinąć stronę niżej, żeby odsłonić więcej UI.
+        recommended = "scroll_page_down"
     else:
         recommended = "idle"
+
+    # Szkic podpowiedzi czytania (layout tła -> priorytet regionów)
+    reading_hints: Dict[str, Any] = {}
+    if background_layout:
+        reading_hints["layout"] = background_layout
+        label_bg: Dict[str, Any] = {}
+        for name, obj in top_labels.items():
+            if not isinstance(obj, dict):
+                continue
+            info: Dict[str, Any] = {}
+            if "bg_cluster_id" in obj:
+                info["bg_cluster_id"] = obj.get("bg_cluster_id")
+            if "bg_is_main_like" in obj:
+                info["bg_is_main_like"] = bool(obj.get("bg_is_main_like"))
+            if "bg_mean_rgb" in obj:
+                info["bg_mean_rgb"] = obj.get("bg_mean_rgb")
+            if "bg_dist_to_global" in obj:
+                info["bg_dist_to_global"] = obj.get("bg_dist_to_global")
+            if info:
+                label_bg[name] = info
+        if label_bg:
+            reading_hints["labels_by_bg"] = label_bg
+
+        main_cluster_id = background_layout.get("main_cluster_id")
+        if main_cluster_id is not None:
+            reading_hints["primary_bg_cluster_id"] = main_cluster_id
+            preferred_labels = [
+                name
+                for name, info in label_bg.items()
+                if info.get("bg_cluster_id") == main_cluster_id
+            ]
+            reading_hints["preferred_labels_main_bg"] = preferred_labels
 
     brain = {
         "timestamp": time.time(),
@@ -111,6 +153,8 @@ def build_brain_state(
             "next": next_candidate,
             "cookies": cookies_candidate,
         },
+        "background_layout": background_layout,
+        "reading_hints": reading_hints,
     }
     return brain
 

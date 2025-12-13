@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Batch hover-bot generator (EasyOCR-based).
+Batch hover-bot generator (PaddleOCR-based).
 
-Processes every image in the source directory, runs EasyOCR, and produces
+Processes every image in the source directory, runs PaddleOCR, and produces
 annotated copies in the destination directory with the requested dot pattern.
 Metadata (boxes + dots) is written to a JSON file alongside each annotated image.
 """
@@ -10,14 +10,25 @@ Metadata (boxes + dots) is written to a JSON file alongside each annotated image
 from __future__ import annotations
 
 import json
+import os
 import random
 import sys
+import time
 from dataclasses import dataclass, asdict
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, List, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
+try:
+    from paddleocr import PaddleOCR
+except ImportError:  # pragma: no cover - optional dependency
+    PaddleOCR = None  # type: ignore[assignment]
+try:
+    import paddle
+except ImportError:  # pragma: no cover - optional dependency
+    paddle = None  # type: ignore[assignment]
 
 # Ensure project root on sys.path so `utils` imports work when running from anywhere
 PROJECT_ROOT = next(
@@ -27,15 +38,18 @@ PROJECT_ROOT = next(
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
-from utils.ocr_features import (
-    OCRNotAvailableError,
-    create_easyocr_reader,
-)
+try:
+    # Prefer shared definition (used elsewhere in the project)
+    from utils.ocr_features import OCRNotAvailableError  # type: ignore
+except Exception:
+    class OCRNotAvailableError(RuntimeError):
+        """Raised when OCR backend is unavailable but required."""
 
 
 # Input / output roots (no CLI flags by design)
-SOURCE_DIR = Path("data/test_hover")
+SOURCE_DIR = Path("data/")
 OUTPUT_DIR = Path("data/processed")
+DEBUG_DIR = PROJECT_ROOT / "debug"
 
 # Dot sampling parameters
 STEP_RANGE = (30.0, 70.0)
@@ -54,21 +68,27 @@ ALIGN_DOTS_PER_LINE = True
 # Increase spacing between dots (multiplier on sampled step)
 DOT_SPACING_SCALE = 0.25  # 4x czesciej: 1.0/4 = 0.25
 # Vertical jitter config relative to bottom of box
-Y_BASE_RANGE = (-30.0, 10.0)
-Y_NOISE_RANGE = (-0.36, 0.36)
-DOT_Y_DAMPING = 0.32
+# Narrower range + slightly stronger damping for more "hand-drawn" wobble
+Y_BASE_RANGE = (-8.0, 6.0)
+Y_NOISE_RANGE = (-0.25, 0.25)
+DOT_Y_DAMPING = 0.5
+# Smoothing współczynnika przejścia między kolejnymi kropkami w pionie.
+# 1.0 ~ bardzo „górzyste”, 0.2–0.4 ~ bardziej płynne, jak ręka człowieka.
+DOT_Y_STEP_SMOOTH = 0.35
 CONTINUOUS_DOTS_PER_LINE = True
 # Sticky blend toward a shared line baseline (0..1)
 STICKY_BASELINE = 0.4
 # OU process params for smooth vertical motion
-OU_THETA = 0.12
-OU_SIGMA = 9.5
-OU_MU = -10.0
+# Stronger pull to mean + lower noise => smoother, human-like drift
+OU_THETA = 0.22
+OU_SIGMA = 3.5
+OU_MU = -3.0
 # Fixation/saccade stepping multipliers
+# Slightly smaller jumps for more natural speed changes
 FIXATION_INIT_PROB = 0.7
-FIXATION_SWITCH_PROB = 0.12
-FIX_STEP_MULT = 0.5
-SAC_STEP_MULT = 2.6
+FIXATION_SWITCH_PROB = 0.18
+FIX_STEP_MULT = 0.7
+SAC_STEP_MULT = 1.9
 # Dot rendering
 DOT_RADIUS = 3
 DOT_ALPHA = 0.6
@@ -81,7 +101,83 @@ BOTTOM_CLEAR_MIN = 1.0
 DETECT_LINE_GAPS = True
 SPACE_GAP_MIN_RATIO = 0.35  # fraction of line height
 SPACE_GAP_MIN_PX = 14       # absolute pixels
- 
+
+PERF_ENABLED = os.environ.get("HOVER_PERF_LOG", "0") == "1"
+_CACHED_READER: PaddleOCR | None = None
+
+def _resolve_preferred_gpu(preferred: bool | None = None) -> bool:
+    if preferred is not None:
+        return preferred
+    env = os.environ.get("HOVER_PADDLE_USE_GPU")
+    if env:
+        norm = env.strip().lower()
+        if norm in {"1", "true", "yes", "on"}:
+            return True
+        if norm in {"0", "false", "no", "off"}:
+            return False
+    if paddle is not None:
+        try:
+            return paddle.is_compiled_with_cuda()
+        except AttributeError:
+            return False
+    return False
+@lru_cache(maxsize=None)
+def create_paddleocr_reader(lang: str = OCR_LANG, **kwargs) -> PaddleOCR:
+    """
+    Lazily construct a PaddleOCR reader. Cached to avoid repeated model loads.
+    """
+    global _CACHED_READER
+    if _CACHED_READER is not None:
+        print("[INFO] Reusing PaddleOCR reader from RAM (cache warm).")
+        return _CACHED_READER
+    if PaddleOCR is None:
+        raise OCRNotAvailableError(
+            "paddleocr is required for scripts/hard_bot/hover_bot.py. "
+            "Install with `pip install paddleocr`."
+        )
+    use_gpu = kwargs.pop("use_gpu", None)
+    resolved_gpu = _resolve_preferred_gpu(use_gpu)
+    attempts = [
+        dict(lang=lang, use_angle_cls=True, show_log=False, use_gpu=resolved_gpu, **kwargs),
+        dict(lang=lang, use_angle_cls=True, show_log=False, **kwargs),
+        dict(lang=lang, **kwargs),
+    ]
+    last_exc: Exception | None = None
+    for params in attempts:
+        try:
+            _CACHED_READER = PaddleOCR(**params)
+            print("[INFO] PaddleOCR reader initialized (models loaded from disk cache).")
+            return _CACHED_READER
+        except Exception as exc:  # pragma: no cover - optional dependency
+            last_exc = exc
+            continue
+    raise OCRNotAvailableError(
+        "paddleocr is required for scripts/hard_bot/hover_bot.py. "
+        "Install with `pip install paddleocr`."
+    ) from last_exc
+
+
+def _capture_screenshot(target_dir: Path) -> Path | None:
+    """
+    Capture a full-screen screenshot into target_dir. Best-effort; returns None on failure.
+    """
+    target_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        from PIL import ImageGrab  # type: ignore
+    except Exception as exc:
+        print(f"[WARN] Screenshot skipped (ImageGrab unavailable): {exc}")
+        return None
+
+    try:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        path = target_dir / f"screenshot_{ts}.png"
+        img = ImageGrab.grab()
+        img.save(str(path))
+        print(f"[INFO] Screenshot saved: {path}")
+        return path
+    except Exception as exc:
+        print(f"[WARN] Failed to capture screenshot: {exc}")
+        return None
 
 
 @dataclass
@@ -221,7 +317,7 @@ def generate_dots_for_box(polygon: Sequence[Sequence[float]]) -> List[Tuple[floa
     y0 = max(dot_origin_y, anchor_y)
     dots.append((prev_x, y0))
 
-    # Incremental vertical offset with reflect clamp inside [-30, 60]
+    # Incremental vertical offset with reflect clamp inside Y_BASE_RANGE
     low, high = Y_BASE_RANGE
 
     def reflect_into(v: float, lo: float, hi: float) -> float:
@@ -240,9 +336,12 @@ def generate_dots_for_box(polygon: Sequence[Sequence[float]]) -> List[Tuple[floa
         next_x = prev_x + step
         if next_x >= max_x:
             next_x = max_x
+        # Losujemy „docelowe” przesunięcie, ale zbliżamy się do niego stopniowo,
+        # żeby kolejne kropki nie skakały jak zęby piły.
         base = random.uniform(low, high)
         noise = random.uniform(*Y_NOISE_RANGE)
-        delta = (base * (1.0 + noise)) * float(DOT_Y_DAMPING)
+        target = base * (1.0 + noise)
+        delta = (target - curr) * float(DOT_Y_DAMPING) * float(DOT_Y_STEP_SMOOTH)
         curr = reflect_into(curr + delta, low, high)
         yv = dot_origin_y + curr
         yv = max(yv, anchor_y)
@@ -285,36 +384,83 @@ def _normalise_ocr_entry(entry) -> Tuple[Sequence[Sequence[float]], str, float]:
     raise ValueError(f"Unrecognised OCR entry format: {type(entry)}")
 
 
-def run_ocr(image_path: Path, *, reader) -> Iterable[Tuple[Sequence[Sequence[float]], str, float]]:
-    image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+def run_ocr(
+    image_path: Path,
+    *,
+    reader,
+    image: np.ndarray | None = None,
+) -> Iterable[Tuple[Sequence[Sequence[float]], str, float]]:
+    """
+    Run OCR on a preloaded image (or load it if None). Passing the image avoids
+    double decoding when the caller also needs it for annotation.
+    """
     if image is None:
-        raise RuntimeError(f"Failed to load image: {image_path}")
-    # EasyOCR returns list of (box, text, conf)
-    results = reader.readtext(image, detail=1, paragraph=False)
-    for item in results:
-        if not isinstance(item, (list, tuple)) or len(item) != 3:
+        image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        if image is None:
+            raise RuntimeError(f"Failed to load image: {image_path}")
+
+    # Lightweight downscale for OCR – przy hover interesuje nas
+    # głównie ogólny układ UI, nie pikselowa dokładność.
+    h, w = image.shape[:2]
+    try:
+        # Domyślnie nie zmniejszaj obrazu (0 = pełna rozdzielczość).
+        target_side = int(os.environ.get("HOVER_OCR_TARGET_SIDE", "0"))
+    except Exception:
+        target_side = 0
+    scale = 1.0
+    if max(h, w) > target_side and target_side > 0:
+        scale = target_side / float(max(h, w))
+        new_w = max(2, int(round(w * scale)))
+        new_h = max(2, int(round(h * scale)))
+        image_resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    else:
+        image_resized = image
+
+    def _iter_entries(items):
+        for it in items:
+            if not it:
+                continue
+            if isinstance(it, (list, tuple)) and len(it) == 2 and isinstance(it[1], (tuple, list)):
+                yield it
+            elif isinstance(it, (list, tuple)):
+                for sub in _iter_entries(it):
+                    yield sub
+
+    try:
+        results = reader.ocr(image_resized, cls=False)
+    except TypeError:
+        results = reader.ocr(image_resized)
+    for item in _iter_entries(results):
+        try:
+            box, meta = item
+            # Skala była zastosowana przed OCR – przeskaluj współrzędne
+            # z powrotem do przestrzeni oryginalnego obrazu.
+            if scale != 1.0:
+                box = [[float(x) / scale, float(y) / scale] for x, y in box]
+            text = meta[0] if isinstance(meta, (list, tuple)) and meta else ""
+            score = float(meta[1]) if isinstance(meta, (list, tuple)) and len(meta) >= 2 else 0.0
+            yield box, text, score
+        except Exception:
             continue
-        box, text, score = item
-        yield box, text, float(score)
 
 
-def process_image(image_path: Path, *, reader) -> Tuple[List[DotSequence], np.ndarray]:
-    sequences: List[DotSequence] = []
-    for idx, (polygon, text, confidence) in enumerate(run_ocr(image_path, reader=reader)):
-        dots = generate_dots_for_box(polygon)
-        sequences.append(
-            DotSequence(
-                index=idx,
-                text=text,
-                confidence=confidence,
-                box=[(float(x), float(y)) for x, y in polygon],
-                dots=[(float(x), float(y)) for x, y in dots],
-            )
-        )
+def _postprocess_sequences(
+    image: np.ndarray,
+    sequences: List[DotSequence],
+    t0: float | None = None,
+) -> Tuple[List[DotSequence], np.ndarray, dict]:
+    """
+    Shared post-processing for hover sequences:
+    - optional dot synthesis/alignment across words/lines,
+    - gap-box detection between neighbors,
+    - annotated overlay rendering + lightweight timings.
 
-    image = cv2.imread(str(image_path))
-    if image is None:
-        raise RuntimeError(f"Failed to load image: {image_path}")
+    This is used both by the classic OCR-based pipeline (process_image)
+    and the "boxes-only" variant (process_from_boxes), so that both paths
+    generate identyczne kroki, gappy i overlay.
+    """
+    if t0 is None:
+        t0 = time.perf_counter()
 
     # Optionally synthesize dots with continuity across words in the same line,
     # or align rows per visual text line.
@@ -455,7 +601,7 @@ def process_image(image_path: Path, *, reader) -> Tuple[List[DotSequence], np.nd
                 delta = group_origin - cur_origin
                 sequences[idx].dots = [(x, y + delta) for (x, y) in sequences[idx].dots]
 
-        # Detect and insert gap boxes (spaces/tabs) between neighbors on the same line
+    # Detect and insert gap boxes (spaces/tabs) between neighbors on the same line
     if DETECT_LINE_GAPS and sequences:
         # Prepare line groups by vertical proximity
         items = []  # (idx, min_x, max_x, min_y, max_y, height, center_y)
@@ -469,7 +615,7 @@ def process_image(image_path: Path, *, reader) -> Tuple[List[DotSequence], np.nd
             center_y = 0.5 * (min_y + max_y)
             items.append((i, min_x, max_x, min_y, max_y, height, center_y))
         # group by center_y
-        groups: list[dict] = []
+        groups = []
         for it in sorted(items, key=lambda t: t[6]):
             i, min_x, max_x, min_y, max_y, height, center_y = it
             placed = False
@@ -515,6 +661,10 @@ def process_image(image_path: Path, *, reader) -> Tuple[List[DotSequence], np.nd
                 )
         if new_gaps:
             sequences.extend(new_gaps)
+
+    t_ocr = time.perf_counter()
+    # after OCR + optional dot/gap synthesis, before drawing
+    t_dots = time.perf_counter()
 
     annotated = image.copy()
     overlay = annotated.copy()
@@ -573,24 +723,105 @@ def process_image(image_path: Path, *, reader) -> Tuple[List[DotSequence], np.nd
     except Exception:
         # fallback if parameters go wrong
         pass
+    t_annot = time.perf_counter()
+    if PERF_ENABLED:
+        # Lightweight timing log to keep an eye on CPU split between JSON and drawing
+        print(
+            f"[PERF] hover_bot: load+ocr={(t_ocr - t0):.3f}s | "
+            f"dots/gaps={(t_dots - t_ocr):.3f}s | "
+            f"annot={(t_annot - t_dots):.3f}s | total={(t_annot - t0):.3f}s"
+        )
 
-    return sequences, annotated
+    timings = {
+        "load_ocr_s": round(t_ocr - t0, 6),
+        "dots_gaps_s": round(t_dots - t_ocr, 6),
+        "annot_s": round(t_annot - t_dots, 6),
+        "total_s": round(t_annot - t0, 6),
+    }
+
+    return sequences, annotated, timings
+
+
+def process_image(
+    image_path: Path, *, reader
+) -> Tuple[List[DotSequence], np.ndarray, dict]:
+    """
+    Classic hover-bot entry point: run PaddleOCR on the image and
+    then feed the detected boxes into the shared post-processing.
+    """
+    t0 = time.perf_counter()
+    image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    if image is None:
+        raise RuntimeError(f"Failed to load image: {image_path}")
+
+    sequences: List[DotSequence] = []
+    for idx, (polygon, text, confidence) in enumerate(run_ocr(image_path, reader=reader, image=image)):
+        dots = generate_dots_for_box(polygon)
+        sequences.append(
+            DotSequence(
+                index=idx,
+                text=text,
+                confidence=confidence,
+                box=[(float(x), float(y)) for x, y in polygon],
+                dots=[(float(x), float(y)) for x, y in dots],
+            )
+        )
+
+    return _postprocess_sequences(image, sequences, t0=t0)
+
+
+def process_from_boxes(
+    image_path: Path,
+    boxes: Iterable[Tuple[Sequence[Sequence[float]] | Sequence[float], str, float]],
+) -> Tuple[List[DotSequence], np.ndarray, dict]:
+    """
+    Alternative entry point: reuse region_grow (or any other) OCR
+    results by passing already-detected text boxes.
+
+    This function does *not* invoke PaddleOCR at all. It only:
+    - converts input polygons/text/conf into DotSequence objects,
+    - generates dots via generate_dots_for_box,
+    - runs the same post-processing and overlay drawing logic as
+      process_image, so both paths stay in sync.
+    """
+    t0 = time.perf_counter()
+    image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    if image is None:
+        raise RuntimeError(f"Failed to load image: {image_path}")
+
+    sequences: List[DotSequence] = []
+    for idx, (polygon, text, confidence) in enumerate(boxes):
+        dots = generate_dots_for_box(polygon)
+        sequences.append(
+            DotSequence(
+                index=idx,
+                text=text,
+                confidence=float(confidence),
+                box=[(float(x), float(y)) for x, y in polygon],
+                dots=[(float(x), float(y)) for x, y in dots],
+            )
+        )
+
+    return _postprocess_sequences(image, sequences, t0=t0)
 
 
 
-def main() -> None:
+def main(*, capture_screen: bool = False) -> None:
     random.seed()
     np.random.seed()
+
+    if capture_screen:
+        _capture_screenshot(SOURCE_DIR)
 
     if not SOURCE_DIR.exists():
         raise FileNotFoundError(f"Source directory not found: {SOURCE_DIR}")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     try:
-        reader = create_easyocr_reader(lang=OCR_LANG)
+        reader = create_paddleocr_reader(lang=OCR_LANG)
     except OCRNotAvailableError as exc:
         raise ImportError(
-            "easyocr is required for scripts/hard_bot/hover_bot.py. Install with `pip install easyocr`."
+            "paddleocr is required for scripts/hard_bot/hover_bot.py. Install with `pip install paddleocr`."
         ) from exc
 
     image_paths = sorted(
@@ -600,10 +831,12 @@ def main() -> None:
         print(f"[WARN] No images found in {SOURCE_DIR}")
         return
 
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+
     for image_path in image_paths:
         print(f"[INFO] Processing {image_path.name}")
         try:
-            sequences, annotated = process_image(image_path, reader=reader)
+            sequences, annotated, timings = process_image(image_path, reader=reader)
         except Exception as exc:
             print(f"[ERROR] Failed to process {image_path}: {exc}")
             continue
@@ -611,12 +844,30 @@ def main() -> None:
         annotated_path = OUTPUT_DIR / image_path.name
         json_path = annotated_path.with_suffix(".json")
 
-        cv2.imwrite(str(annotated_path), annotated)
-        json_path.write_text(json.dumps([asdict(seq) for seq in sequences], ensure_ascii=False, indent=2), encoding="utf-8")
+        # Najpierw JSON (agent go szybciej odczyta), potem obraz poglądowy
+        payload = [asdict(seq) for seq in sequences]
+        json_payload = json.dumps(payload, ensure_ascii=False, indent=2)
+        json_path.write_text(json_payload, encoding="utf-8")
 
-        print(f"  -> annotated: {annotated_path}")
+        # Mirror latest timings (not dots) into root/debug for quick inspection
+        debug_payload = {
+            "image": image_path.name,
+            "timings_s": timings,
+            "sequence_count": len(sequences),
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        debug_path = DEBUG_DIR / "hover_bot_latest.json"
+        try:
+            debug_path.write_text(json.dumps(debug_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"  -> debug timings: {debug_path}")
+        except Exception as exc:
+            print(f"[WARN] Failed to write debug timings to {debug_path}: {exc}")
+
+        cv2.imwrite(str(annotated_path), annotated)
+
         print(f"  -> metadata : {json_path}")
+        print(f"  -> annotated: {annotated_path}")
 
 
 if __name__ == "__main__":
-    main()
+    main(capture_screen=True)

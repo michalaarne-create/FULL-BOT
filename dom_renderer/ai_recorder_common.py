@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple, Set
 # Configuration
 # -----------------------------------------------------------------------------
 
-START_URL_DEFAULT = os.environ.get("START_URL", "https://www.google.com")
+START_URL_DEFAULT = os.environ.get("START_URL", "")
 SNAPSHOT_FPS_DEFAULT = 3.0
 OCR_INTERVAL = 1.0
 RECORD_SCREENSHOTS = True

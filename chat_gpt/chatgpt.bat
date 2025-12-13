@@ -3,10 +3,17 @@ setlocal EnableDelayedExpansion
 chcp 65001 >nul
 title Dual ChatGPT Orchestrator (VM, classic input)
 
-REM === KONFIG (DOSTOSUJ DO VM) ===
-set "BASE_DIR=E:\BOT ANK\bot\moje_AI"
-set "WORK_DIR=%BASE_DIR%\yolov8\FULL BOT"
-set "REC_OUTPUT_DIR=%WORK_DIR%\dom_live"
+REM === KONFIG (AUTOMATYCZNE SCIEZKI WZGL. TEGO .BAT) ===
+REM katalog z tym plikiem .bat
+set "SCRIPT_DIR=%~dp0"
+REM WORK_DIR = katalog nadrzedny wzgledem chat_gpt (czyli FULL BOT)
+pushd "%SCRIPT_DIR%.." >nul
+set "WORK_DIR=%CD%"
+popd >nul
+REM BASE_DIR = katalog nadrzedny wzgledem FULL BOT (czyli moje_AI)
+pushd "%WORK_DIR%.." >nul
+set "BASE_DIR=%CD%"
+popd >nul
 set "REC_OUTPUT_DIR=%WORK_DIR%\dom_live"
 
 REM skrypty (względem WORK_DIR)
@@ -14,6 +21,8 @@ set "CONTROL_AGENT=%WORK_DIR%\scripts\control_agent\control_agent.py"
 set "KBD_AGENT=%WORK_DIR%\scripts\control_agent\kbd_scroll_agent.py"
 set "ORCHESTRATOR=%WORK_DIR%\scripts\dual_chatgpt_consensus\dual_chatgpt_consensus.py"
 set "AI_REC=%WORK_DIR%\dom_renderer\ai_recorder_live.py"
+set "AI_REC_BAT=%WORK_DIR%\chat_gpt\run_ai_recorder.bat"
+
 
 REM recorder potrzebuje dom_renderer w PYTHONPATH
 set "PYTHONPATH=%WORK_DIR%;%BASE_DIR%"
@@ -90,17 +99,21 @@ if not exist "%AI_REC%" (
     echo [FATAL] Brak pliku ai_recorder_live.py pod: %AI_REC%
     goto HOLD
 )
+if not exist "%AI_REC_BAT%" (
+    echo [FATAL] Brak pliku run_ai_recorder.bat pod: %AI_REC_BAT%
+    goto HOLD
+)
 
 REM === start control_agent (MINIMIZED, osobne okno, cmd /K – NIE zamknie sie samo) ===
 echo [RUN] control_agent...
-echo [CMD] %PYTHON% "%CONTROL_AGENT%" --config scripts\control_agent\train.json --port %CONTROL_AGENT_PORT%
-start "control_agent" /MIN /D "%WORK_DIR%" cmd /K %PYTHON% "%CONTROL_AGENT%" --config scripts\control_agent\train.json --port %CONTROL_AGENT_PORT%
+echo [CMD] "%PYTHON%" "%CONTROL_AGENT%" --config scripts\control_agent\train.json --port %CONTROL_AGENT_PORT%
+start "control_agent" /MIN /D "%WORK_DIR%" cmd /K "%PYTHON%" "%CONTROL_AGENT%" --config scripts\control_agent\train.json --port %CONTROL_AGENT_PORT%
 
 REM === start kbd_scroll_agent (MINIMIZED, osobne okno) ===
 if exist "%KBD_AGENT%" (
     echo [RUN] kbd_scroll_agent...
-    echo [CMD] %PYTHON% "%KBD_AGENT%" --port %KBD_AGENT_PORT%
-    start "kbd_scroll_agent" /MIN /D "%WORK_DIR%" cmd /K %PYTHON% "%KBD_AGENT%" --port %KBD_AGENT_PORT%
+    echo [CMD] "%PYTHON%" "%KBD_AGENT%" --port %KBD_AGENT_PORT%
+    start "kbd_scroll_agent" /MIN /D "%WORK_DIR%" cmd /K "%PYTHON%" "%KBD_AGENT%" --port %KBD_AGENT_PORT%
 ) else (
     echo [WARN] Brak pliku: %KBD_AGENT%  (pomijam agenta klawiatury)
 )
@@ -109,13 +122,8 @@ REM === start AI Recorder Live (NORMALNE okno, debug) ===
 echo [RUN] AI Recorder Live (DEBUG, widoczne okno)...
 echo [INFO] W nowo otwartym oknie "ai_recorder_live" zobaczysz ewentualne bledy (Playwright, CDP, brak modulu itp).
 
-if defined RECORDER_USER_DATA_DIR (
-    echo [CMD] %PYTHON% "%AI_REC%" --output-dir "%REC_OUTPUT_DIR%" --chrome-exe "%RECORDER_BROWSER_EXE%" --user-data-dir "%RECORDER_USER_DATA_DIR%" --profile-directory "%RECORDER_PROFILE_DIR%" --url "https://chat.openai.com" --fps 2 --dom-only --log-file "%REC_OUTPUT_DIR%\rec.log" --verbose
-    start "ai_recorder_live" /D "%WORK_DIR%" cmd /K %PYTHON% "%AI_REC%" --output-dir "%REC_OUTPUT_DIR%" --chrome-exe "%RECORDER_BROWSER_EXE%" --user-data-dir "%RECORDER_USER_DATA_DIR%" --profile-directory "%RECORDER_PROFILE_DIR%" --url "https://chat.openai.com" --fps 2 --dom-only --log-file "%REC_OUTPUT_DIR%\rec.log" --verbose
-) else (
-    echo [CMD] %PYTHON% "%AI_REC%" --output-dir "%REC_OUTPUT_DIR%" --url "https://chat.openai.com" --fps 2 --dom-only --log-file "%REC_OUTPUT_DIR%\rec.log" --verbose
-    start "ai_recorder_live" /D "%WORK_DIR%" cmd /K %PYTHON% "%AI_REC%" --output-dir "%REC_OUTPUT_DIR%" --url "https://chat.openai.com" --fps 2 --dom-only --log-file "%REC_OUTPUT_DIR%\rec.log" --verbose
-)
+echo [CMD] start "ai_recorder_live" /D "%WORK_DIR%" cmd /K ""%AI_REC_BAT%""
+start "ai_recorder_live" /D "%WORK_DIR%" cmd /K ""%AI_REC_BAT%""
 
 echo.
 echo [INFO] Poczekaj az otworzy sie przegladarka z okna recorder'a.
@@ -149,24 +157,33 @@ echo [OK] Pliki recorder'a wykryte:
 dir "%REC_OUTPUT_DIR%\current_*.*"
 echo.
 
-REM === Orchestrator w TYM oknie (tu wpiszesz pierwszy prompt) ===
-echo [RUN] Orchestrator – za chwile poprosi cie o pierwszy prompt dla Chat A:
+REM === Orchestrator w OSOBNYM oknie (tu wpiszesz pierwszy prompt) ===
+echo [RUN] Orchestrator - osobne okno (ta konsola moze byc zamknieta bez ubijania innych okien).
 echo.
-echo [CMD] %PYTHON% %ORCHESTRATOR% --rec-dir "%REC_OUTPUT_DIR%" --port-mouse %CONTROL_AGENT_PORT% --port-kbd %KBD_AGENT_PORT% --max-rounds %MAX_ROUNDS% --reply-wait %REPLY_WAIT%
+echo [CMD] start "orchestrator" /D "%WORK_DIR%" cmd /K ""%PYTHON%" "%ORCHESTRATOR%" --rec-dir "%REC_OUTPUT_DIR%" --port-mouse %CONTROL_AGENT_PORT% --port-kbd %KBD_AGENT_PORT% --max-rounds %MAX_ROUNDS% --reply-wait %REPLY_WAIT%""
 echo.
+start "orchestrator" /D "%WORK_DIR%" cmd /K ""%PYTHON%" "%ORCHESTRATOR%" --rec-dir "%REC_OUTPUT_DIR%" --port-mouse %CONTROL_AGENT_PORT% --port-kbd %KBD_AGENT_PORT% --max-rounds %MAX_ROUNDS% --reply-wait %REPLY_WAIT%""
 
-%PYTHON% %ORCHESTRATOR% --rec-dir "%REC_OUTPUT_DIR%" --port-mouse %CONTROL_AGENT_PORT% --port-kbd %KBD_AGENT_PORT% --max-rounds %MAX_ROUNDS% --reply-wait %REPLY_WAIT%
-
 echo.
-echo [DONE] Orchestrator zakonczyl prace.
-echo [INFO] Okna "control_agent", "kbd_scroll_agent" i "ai_recorder_live"
-echo        zostaly uruchomione osobno – zamknij je recznie, jesli chcesz.
+echo [INFO] Orchestrator wystartowal w osobnym oknie.
+echo [INFO] Ta konsola zostanie na HOLD; po wcisnieciu klawisza ubije wszystkie okna z tego runa.
 echo.
+pause
+goto CLEANUP
 
 :HOLD
 echo.
 echo [HOLD] Skrypt .bat NIE wyjdzie sam. To okno tez zostanie otwarte.
 echo       Wcisnij klawisz albo CTRL+C, zeby zamknac.
 pause
+
+:CLEANUP
+echo [CLEANUP] Ubicie okien: control_agent, kbd_scroll_agent, ai_recorder_live, orchestrator
+for %%T in ("control_agent" "kbd_scroll_agent" "ai_recorder_live" "orchestrator") do (
+    taskkill /FI "WINDOWTITLE eq %%~T" /T /F >nul 2>&1
+)
+echo [CLEANUP] Gotowe. Zamykam.
+
+:END
 endlocal
 exit /b 0

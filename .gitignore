@@ -69,3 +69,11 @@ _recorder_profile/segmentation_platform/ukm_db
 dom_live/rec.log
 dom_live/recorder_debug.log
 dom_live/debug/
+logs/
+temp/
+models/
+dom_live/recorder_debug/
+data/**
+!data/**/
+!data/**/*_current*/
+!data/**/*_current*/**

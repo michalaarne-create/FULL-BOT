@@ -8,10 +8,56 @@ import queue
 import socket
 import threading
 import time
+import subprocess
+import sys
 from collections import deque
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import random
 from pynput.keyboard import Key
+
+# Project root (for screenshots / hover path visuals)
+AGENT_ROOT = Path(__file__).resolve().parents[2]
+DATA_SCREEN_DIR = AGENT_ROOT / "data" / "screen"
+HOVER_DIR = DATA_SCREEN_DIR / "hover"
+RAW_DIR = DATA_SCREEN_DIR / "raw"
+SCREENSHOT_DIR = RAW_DIR / "raw screen"
+HOVER_INPUT_CURRENT_DIR = HOVER_DIR / "hover_input_current"
+RAW_CURRENT_DIR = RAW_DIR / "raw_screens_current"
+HOVER_PATH_DIR = HOVER_DIR / "hover_path"
+HOVER_PATH_CURRENT_DIR = HOVER_DIR / "hover_path_current"
+HOVER_SPEED_DIR = HOVER_DIR / "hover_speed"
+HOVER_SPEED_CURRENT_DIR = HOVER_DIR / "hover_speed_current"
+HOVER_SPEED_RECORDER = AGENT_ROOT / "scripts" / "control_agent" / "hover_speed_recorder.py"
+
+
+def _align_path(points: List[Tuple[float, float]], start: Tuple[float, float], end: Tuple[float, float]) -> List[Tuple[float, float]]:
+    if not points:
+        return []
+    src_dx = points[-1][0] - points[0][0]
+    src_dy = points[-1][1] - points[0][1]
+    dst_dx = end[0] - start[0]
+    dst_dy = end[1] - start[1]
+    src_len = math.hypot(src_dx, src_dy)
+    dst_len = math.hypot(dst_dx, dst_dy)
+    if src_len < 1e-6 or dst_len < 1e-6:
+        return [start, end]
+    scale = dst_len / src_len
+    src_angle = math.atan2(src_dy, src_dx)
+    dst_angle = math.atan2(dst_dy, dst_dx)
+    rot = dst_angle - src_angle
+    cos_r = math.cos(rot)
+    sin_r = math.sin(rot)
+    transformed = []
+    for x, y in points:
+        rel_x = x - points[0][0]
+        rel_y = y - points[0][1]
+        scaled_x = rel_x * scale
+        scaled_y = rel_y * scale
+        tx = scaled_x * cos_r - scaled_y * sin_r
+        ty = scaled_x * sin_r + scaled_y * cos_r
+        transformed.append((start[0] + tx, start[1] + ty))
+    return transformed
 
 # Opcjonalnie NumPy
 try:
@@ -88,6 +134,32 @@ def _curvature_sign_flips(points: List[Tuple[float, float]]) -> int:
     for i in range(1, len(signs)):
         if signs[i] != signs[i-1]: flips += 1
     return flips
+
+def apply_micro_jitter(points: List[Tuple[int, int]], max_jitter_px: float = 1.5, step_std: float = 0.4) -> List[Tuple[int, int]]:
+    """
+    Delikatny, gładki jitter boczny wzdłuż trajektorii.
+    - brak teleportów (offset to mały random-walk),
+    - pierwszy i ostatni punkt zostają bez zmian.
+    """
+    if len(points) < 3 or max_jitter_px <= 0.0:
+        return points
+    out: List[Tuple[int, int]] = [points[0]]
+    lat_prev = 0.0
+    for i in range(1, len(points) - 1):
+        x_prev, y_prev = points[i - 1]
+        x_next, y_next = points[i + 1]
+        vx, vy = x_next - x_prev, y_next - y_prev
+        L = math.hypot(vx, vy) or 1.0
+        # jednostkowa normalna do kierunku lokalnego
+        nx, ny = -vy / L, vx / L
+        lat = lat_prev + random.gauss(0.0, step_std)
+        lat = max(-max_jitter_px, min(max_jitter_px, lat))
+        x_j = points[i][0] + nx * lat
+        y_j = points[i][1] + ny * lat
+        out.append((int(round(x_j)), int(round(y_j))))
+        lat_prev = lat
+    out.append(points[-1])
+    return out
 
 def moving_average(points: List[Tuple[int,int]], win: int) -> List[Tuple[int,int]]:
     if win <= 1 or len(points) <= 2: return points
@@ -229,6 +301,33 @@ class ExactLibrary:
             score = angle_pen + 0.25 * scale_pen + flips_pen + straight_bonus
             if score < best_score: best, best_score = s, score
         return best if best else (max(self.samples, key=lambda s: s["straightness"]) if self.samples else None)
+    
+    def pick_random(self, start: Tuple[int, int], target: Tuple[int, int], want_slider: Optional[bool], curvy: str = "auto", top_k: int = 30) -> Optional[Dict[str, Any]]:
+        sx, sy = start; tx, ty = target
+        vx, vy = tx - sx, ty - sy
+        vnorm = math.hypot(vx, vy)
+        if vnorm < 1.0: return None
+        vtheta = math.atan2(vy, vx)
+        thr = {"less": 0.995, "auto": 0.985, "more": 0.970}.get(curvy, 0.985)
+        pool = [s for s in self.samples if (want_slider is None or s["is_slider"] == want_slider) and s["straightness"] >= thr]
+        if not pool:
+            pool = sorted([s for s in self.samples if (want_slider is None or s["is_slider"] == want_slider)], key=lambda s: s["straightness"], reverse=True)
+            pool = pool[:min(80, len(pool))]
+        if not pool: return None
+
+        scored = []
+        for s in pool:
+            angle_pen = self._angle_diff(vtheta, s["theta"])
+            scale_pen = abs(math.log(vnorm / max(1e-6, s["norm"])))
+            flips_pen = (0.15 if (vnorm / max(1e-6, s["norm"])) > 1.5 else 0.08) * max(0, s.get("flips", 0) - 1)
+            straight_bonus = 1.2 - s["straightness"]
+            score = angle_pen + 0.25 * scale_pen + flips_pen + straight_bonus
+            scored.append((score, s))
+
+        scored.sort(key=lambda t: t[0])
+        k = min(top_k, len(scored))
+        choice = random.choice(scored[:k]) if scored else None
+        return choice[1] if choice else None
     
     @staticmethod
     def retarget(sample: Dict[str, Any], start_xy: Tuple[int, int], end_xy: Tuple[int, int]) -> Tuple[List[Tuple[int, int]], List[float]]:
@@ -425,6 +524,190 @@ class ControlAgent:
         else:
             print(f"[Agent] Unknown command: {c}")
 
+    def _render_hover_path(self, trace_stem: str, pts: List[Tuple[int,int]]) -> None:
+        """
+        Render the true executed hover path over a screenshot.
+
+        Historical PNGs -> DATA_SCREEN_DIR/hover/hover_path/<stem>_hover_path.png
+        Current PNG     -> DATA_SCREEN_DIR/hover/hover_path_current/hover_path.png
+
+        Colour encoding (per pixel visit count):
+            1x  -> green
+            2x  -> blue
+            3x  -> yellow
+            4x  -> orange
+            5+x -> red
+        """
+        if not pts or len(pts) < 2:
+            return
+        stem = trace_stem.strip()
+        if not stem:
+            return
+        screen_path = SCREENSHOT_DIR / f"{stem}.png"
+        if screen_path.exists():
+            src_img = screen_path
+        else:
+            candidate = HOVER_INPUT_CURRENT_DIR / "hover_input.png"
+            if candidate.exists():
+                src_img = candidate
+            else:
+                src_img = RAW_CURRENT_DIR / "screenshot.png"
+        if not src_img.exists():
+            return
+        try:
+            from PIL import Image  # type: ignore
+            import numpy as _np  # local alias
+        except Exception:
+            return
+        try:
+            img = Image.open(src_img).convert("RGB")
+        except Exception:
+            return
+        arr = _np.array(img, dtype=_np.uint8)
+        h, w, _ = arr.shape
+        counts = _np.zeros((h, w), dtype=_np.uint8)
+
+        def _clip_xy(x: int, y: int) -> Tuple[int, int]:
+            return int(_np.clip(x, 0, w - 1)), int(_np.clip(y, 0, h - 1))
+
+        for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+            x0, y0 = _clip_xy(x0, y0)
+            x1, y1 = _clip_xy(x1, y1)
+            dx = x1 - x0
+            dy = y1 - y0
+            steps = max(abs(dx), abs(dy))
+            if steps == 0:
+                counts[y0, x0] = _np.clip(counts[y0, x0] + 1, 0, 255)
+                continue
+            xs = _np.linspace(x0, x1, steps + 1, dtype=_np.int32)
+            ys = _np.linspace(y0, y1, steps + 1, dtype=_np.int32)
+            counts[ys, xs] = _np.clip(counts[ys, xs] + 1, 0, 255)
+
+        out = arr.copy()
+        mask1 = counts == 1
+        out[mask1] = _np.array([0, 255, 0], dtype=_np.uint8)
+        mask2 = counts == 2
+        out[mask2] = _np.array([0, 0, 255], dtype=_np.uint8)
+        mask3 = counts == 3
+        out[mask3] = _np.array([255, 255, 0], dtype=_np.uint8)
+        mask4 = counts == 4
+        out[mask4] = _np.array([255, 165, 0], dtype=_np.uint8)
+        mask5 = counts >= 5
+        out[mask5] = _np.array([255, 0, 0], dtype=_np.uint8)
+
+        try:
+            HOVER_PATH_DIR.mkdir(parents=True, exist_ok=True)
+            HOVER_PATH_CURRENT_DIR.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return
+
+        hist_path = HOVER_PATH_DIR / f"{stem}_hover_path.png"
+        current_path = HOVER_PATH_CURRENT_DIR / "hover_path.png"
+        try:
+            Image.fromarray(out).save(hist_path)
+            Image.fromarray(out).save(current_path)
+        except Exception:
+            return
+
+    def _render_hover_speed(self, trace_stem: str, pts: List[Tuple[int, int]], times: List[float]) -> None:
+        """
+        Render heatmap prędkości kursora:
+        - kolory kodują szybkość w px/s wzdłuż ścieżki,
+        - prędkość liczona na odcinkach między punktami.
+
+        Historical PNGs -> DATA_SCREEN_DIR/hover/hover_speed/<stem>_hover_speed.png
+        Current PNG     -> DATA_SCREEN_DIR/hover/hover_speed_current/hover_speed.png
+        """
+        if not pts or len(pts) < 2 or len(times) < 2:
+            return
+        stem = str(trace_stem or "").strip()
+        if not stem:
+            return
+        screen_path = SCREENSHOT_DIR / f"{stem}.png"
+        if screen_path.exists():
+            src_img = screen_path
+        else:
+            candidate = HOVER_INPUT_CURRENT_DIR / "hover_input.png"
+            if candidate.exists():
+                src_img = candidate
+            else:
+                src_img = RAW_CURRENT_DIR / "screenshot.png"
+        if not src_img.exists():
+            return
+        try:
+            from PIL import Image  # type: ignore
+            import numpy as _np  # type: ignore
+        except Exception:
+            return
+        try:
+            img = Image.open(src_img).convert("RGB")
+        except Exception:
+            return
+        arr = _np.array(img, dtype=_np.uint8)
+        h, w, _ = arr.shape
+
+        segments: List[Tuple[Tuple[int, int], Tuple[int, int], float]] = []
+        speeds: List[float] = []
+        for (x0, y0), (x1, y1), t0, t1 in zip(pts, pts[1:], times, times[1:]):
+            dt = float(t1 - t0)
+            if dt <= 1e-4:
+                continue
+            v = math.hypot(float(x1 - x0), float(y1 - y0)) / dt
+            speeds.append(v)
+            segments.append(((int(x0), int(y0)), (int(x1), int(y1)), v))
+        if not speeds:
+            return
+
+        v_min = min(speeds)
+        v_max = max(speeds)
+        if v_max <= v_min + 1e-6:
+            v_max = v_min + 1.0
+
+        def _clip_xy(x: int, y: int) -> Tuple[int, int]:
+            return int(_np.clip(x, 0, w - 1)), int(_np.clip(y, 0, h - 1))
+
+        out = arr.copy()
+        for (x0, y0), (x1, y1), v in segments:
+            x0, y0 = _clip_xy(x0, y0)
+            x1, y1 = _clip_xy(x1, y1)
+            dx = x1 - x0
+            dy = y1 - y0
+            steps = max(abs(dx), abs(dy))
+            if steps <= 0:
+                steps = 1
+            xs = _np.linspace(x0, x1, steps + 1, dtype=_np.int32)
+            ys = _np.linspace(y0, y1, steps + 1, dtype=_np.int32)
+
+            # Normalizuj prędkość do [0,1] i zmapuj: wolno=niebieski -> średnio=zielony -> szybko=czerwony.
+            t = (v - v_min) / (v_max - v_min)
+            t = max(0.0, min(1.0, t))
+            if t < 0.5:
+                # niebieski -> zielony
+                k = t / 0.5
+                r, g, b = 0, int(255 * k), int(255 * (1.0 - k))
+            else:
+                # zielony -> czerwony
+                k = (t - 0.5) / 0.5
+                r, g, b = int(255 * k), int(255 * (1.0 - k)), 0
+            colour = _np.array([r, g, b], dtype=_np.uint8)
+            out[ys, xs] = colour
+
+        try:
+            HOVER_SPEED_DIR.mkdir(parents=True, exist_ok=True)
+            HOVER_SPEED_CURRENT_DIR.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return
+
+        hist_path = HOVER_SPEED_DIR / f"{stem}_hover_speed.png"
+        current_path = HOVER_SPEED_CURRENT_DIR / "hover_speed.png"
+        try:
+            Image.fromarray(out).save(hist_path)
+            Image.fromarray(out).save(current_path)
+        except Exception:
+            return
+        except Exception:
+            return
+
     def _cmd_scroll(self, cmd: Dict[str, Any]):
         """Obsługa komendy scrollowania"""
         direction = cmd.get("direction", "down").lower()
@@ -524,21 +807,60 @@ class ControlAgent:
         return max(max(100.0, float(min_total_ms or 0.0)), base)
 
     def _densify_linear(self, pts: List[Tuple[int,int]], times: List[float], fps: int = 144) -> Tuple[List[Tuple[int,int]], List[float]]:
-        if len(pts) < 2 or times[-1] <= 0: return pts, times
-        T, N = times[-1], max(60, int(times[-1] * fps))
-        new_times = [i * (T / (N - 1)) for i in range(N)]
-        new_pts = []
+        if len(pts) < 2 or times[-1] <= 0:
+            return pts, times
+        T = times[-1]
+        N = max(60, int(T * fps))
+        new_times: List[float] = [i * (T / (N - 1)) for i in range(N)]
+        new_pts: List[Tuple[int, int]] = []
         j = 0
         for tn in new_times:
-            while j + 1 < len(times) and times[j + 1] < tn: j += 1
-            if j + 1 >= len(times): new_pts.append(pts[-1]); continue
-            t0, t1 = times[j], times[j+1]
-            if t1 <= t0: new_pts.append(pts[j]); continue
+            while j + 1 < len(times) and times[j + 1] < tn:
+                j += 1
+            if j + 1 >= len(times):
+                new_pts.append(pts[-1])
+                continue
+            t0, t1 = times[j], times[j + 1]
+            if t1 <= t0:
+                new_pts.append(pts[j])
+                continue
             a = (tn - t0) / (t1 - t0)
-            x = int(round(pts[j][0] + a * (pts[j+1][0] - pts[j][0])))
-            y = int(round(pts[j][1] + a * (pts[j+1][1] - pts[j][1])))
+            x = int(round(pts[j][0] + a * (pts[j + 1][0] - pts[j][0])))
+            y = int(round(pts[j][1] + a * (pts[j + 1][1] - pts[j][1])))
             new_pts.append((x, y))
         new_pts[-1] = pts[-1]
+        return new_pts, new_times
+
+    def _densify_by_pixel(self, pts: List[Tuple[int, int]], times: List[float], max_step_px: float = 1.0) -> Tuple[List[Tuple[int, int]], List[float]]:
+        """
+        Densyfikacja œcie¿ki tak, aby kroki kursora by³y maksymalnie
+        ~1 px (w metryce euklidesowej). Czas interpolujemy liniowo,
+        ¿eby zachowaæ œredni¹ prêdkoœæ.
+        """
+        if len(pts) < 2 or len(pts) != len(times):
+            return pts, times
+        new_pts: List[Tuple[int, int]] = [pts[0]]
+        new_times: List[float] = [times[0]]
+        max_step = max(0.5, float(max_step_px))
+        for (x0, y0, t0), (x1, y1, t1) in zip(
+            [(px, py, pt) for (px, py), pt in zip(pts, times)],
+            [(px, py, pt) for (px, py), pt in zip(pts[1:], times[1:])],
+        ):
+            dx = x1 - x0
+            dy = y1 - y0
+            dist = math.hypot(dx, dy)
+            if dist <= max_step:
+                new_pts.append((x1, y1))
+                new_times.append(t1)
+                continue
+            steps = max(1, int(math.ceil(dist / max_step)))
+            for s in range(1, steps + 1):
+                a = s / steps
+                x = int(round(x0 + dx * a))
+                y = int(round(y0 + dy * a))
+                t = t0 + (t1 - t0) * a
+                new_pts.append((x, y))
+                new_times.append(t)
         return new_pts, new_times
 
     def _postprocess_path(self, pts: List[Tuple[int,int]], times: List[float], start: Tuple[int,int], end: Tuple[int,int]) -> Tuple[List[Tuple[int,int]], List[float]]:
@@ -550,21 +872,34 @@ class ControlAgent:
         pts, times = _blend_lead_in(pts, times, lead_px=24.0, lead_ms=80.0)
         times = _ease_slow_last_third(times, strength=0.95)
         pts, times = self._densify_linear(pts, times, fps=144)
+        # delikatny jitter boczny, proporcjonalny do długości ruchu
+        jitter_amp = min(2.0, 0.02 * max(dist, 1.0))
+        pts = apply_micro_jitter(pts, max_jitter_px=jitter_amp, step_std=0.3)
         pts = clamp_path(pts, margin=1)
         pts[-1] = end
         return pts, times
 
     def _run_timed_points(self, points: List[Tuple[int, int]], times_sec: List[float]):
-        if not points or len(points) < 2: return
+        if not points or len(points) < 2:
+            return
         time_begin_period(1)
         try:
             t0 = time.perf_counter()
+            first_move_logged = False
             for i in range(len(points)):
                 set_cursor_pos_raw(points[i][0], points[i][1])
+                if not first_move_logged and i >= 1:
+                    first_move_logged = True
+                    try:
+                        print(f"[Agent TIMER] first_move {time.perf_counter() - t0:.3f}s after path_start")
+                    except Exception:
+                        pass
                 if i < len(points) - 1:
                     delay = (t0 + times_sec[i+1]) - time.perf_counter()
-                    if delay > 0: precise_sleep(delay)
-        finally: time_end_period(1)
+                    if delay > 0:
+                        precise_sleep(delay)
+        finally:
+            time_end_period(1)
 
     # --- PATH (polyline) execution helpers ---
     @staticmethod
@@ -599,6 +934,7 @@ class ControlAgent:
         line_jump_indices: Optional[List[int]] = None,
         line_jump_boost: float = 1.0,
     ) -> List[float]:
+        t_start = time.perf_counter()
         if len(pts) < 2:
             return [0.0]
         total_dist = 0.0
@@ -619,41 +955,139 @@ class ControlAgent:
         for i, d in enumerate(seg_len):
             share = d / total_dist
             dt = base_T * share
+            # Przyspieszenia traktujemy jako zmianę „częstotliwości” (czasu),
+            # nie jako skok pikseli – więc modyfikujemy tylko dt.
             if any(self._seg_intersects_rect(pts[i], pts[i+1], r) for r in gap_rects):
-                dt /= max(1.0, gap_boost)
+                eff = 1.0 + max(0.0, gap_boost - 1.0) * 0.6  # zmiękcz efekt
+                dt /= max(1.0, eff)
             if i in line_jump_set:
-                dt /= max(1.0, line_jump_boost)
-            # per-segment relative speed randomization
-            x = round(random.uniform(-5.0, 5.0), 4)
-            if random.random() < 0.02:
-                x = round(x * 5.0, 4)
-            seg_speed = max(0.05, seg_speed * (1.0 + x / 100.0))
+                eff = 1.0 + max(0.0, line_jump_boost - 1.0) * 0.6
+                dt /= max(1.0, eff)
+            # Per-segment relative speed randomization (very smooth: tiny random walk).
+            x = random.uniform(-2.0, 2.0)
+            seg_speed = max(0.2, seg_speed + x / 100.0)
             dt /= seg_speed
             dt = max(min_dt, dt)
             t_acc += dt
             times.append(t_acc)
+        if self.verbose:
+            try:
+                print(f"[Agent TIMER] build_times_for_path total={times[-1]:.3f}s compute={time.perf_counter()-t_start:.3f}s")
+            except Exception:
+                pass
+        return times
+
+    def _build_times_for_path_smooth(
+        self,
+        pts: List[Tuple[int,int]],
+        *,
+        speed: str = "normal",
+        duration_ms: Optional[float] = None,
+        min_total_ms: float = 0.0,
+        global_speed_factor: float = 1.0,
+        min_dt: float = 0.004,
+        gap_rects: Optional[List[Tuple[int,int,int,int]]] = None,
+        gap_boost: float = 1.0,
+        line_jump_indices: Optional[List[int]] = None,
+        line_jump_boost: float = 1.0,
+    ) -> List[float]:
+        t_start = time.perf_counter()
+        if len(pts) < 2:
+            return [0.0]
+        total_dist = 0.0
+        seg_len: List[float] = []
+        for i in range(len(pts) - 1):
+            d = math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1])
+            seg_len.append(d)
+            total_dist += d
+        if total_dist <= 0.0:
+            return [0.0, 0.016]
+        base_T = self._target_duration_ms(total_dist, speed, duration_ms, min_total_ms) / 1000.0
+        base_T = max(0.03, base_T)
+        times = [0.0]
+        gap_rects = gap_rects or []
+        line_jump_set = set(line_jump_indices or [])
+        t_acc = 0.0
+        seg_speed = max(0.05, float(global_speed_factor))
+        # Płynny, delikatny akcelerator dla gapów – zamiast
+        # skokowego mnożnika utrzymujemy stan, który powoli
+        # zbliża się do docelowego podczas wchodzenia/wychodzenia z dziur.
+        gap_state = 1.0
+        gap_smooth = 0.8  # 80% poprzedniego stanu, 20% nowego celu
+        for i, d in enumerate(seg_len):
+            share = d / total_dist
+            dt = base_T * share
+            # Przyspieszenia traktujemy jako zmianę częstotliwości (czasu),
+            # nie jako skok pikseli – więc modyfikujemy tylko dt.
+            in_gap = any(self._seg_intersects_rect(pts[i], pts[i + 1], r) for r in gap_rects)
+            if in_gap and gap_boost > 1.0:
+                # Maksymalny efekt gap_boost jest dodatkowo zmiękczony,
+                # tak żeby przyspieszenie było wyczuwalne, ale bardzo ludzko.
+                target = 1.0 + max(0.0, gap_boost - 1.0) * 0.25
+            else:
+                target = 1.0
+            gap_state = gap_state * gap_smooth + target * (1.0 - gap_smooth)
+            dt /= max(1.0, gap_state)
+            if i in line_jump_set:
+                eff = 1.0 + max(0.0, line_jump_boost - 1.0) * 0.6
+                dt /= max(1.0, eff)
+            # Per-segment relative speed randomization (very smooth: tiny random walk).
+            x = random.uniform(-2.0, 2.0)
+            seg_speed = max(0.2, seg_speed + x / 100.0)
+            dt /= seg_speed
+            dt = max(min_dt, dt)
+            t_acc += dt
+            times.append(t_acc)
+        if self.verbose:
+            try:
+                print(f"[Agent TIMER] build_times_for_path_smooth total={times[-1]:.3f}s compute={time.perf_counter()-t_start:.3f}s")
+            except Exception:
+                pass
         return times
 
     def _cmd_path(self, cmd: Dict[str, Any]):
         # Execute polyline path with optional boosts and global speed factor
+        t_cmd_start = time.perf_counter()
         pts_in = cmd.get("points") or []
         if not pts_in or len(pts_in) < 2:
             print("[Path] ignored: too few points")
             return
-        pts: List[Tuple[int,int]] = [(int(p["x"]), int(p["y"])) for p in pts_in]
-        pts = clamp_path(pts, margin=1)
+        pts_raw: List[Tuple[int, int]] = [(int(p["x"]), int(p["y"])) for p in pts_in]
+        pts_raw = clamp_path(pts_raw, margin=1)
         speed = str(cmd.get("speed", "normal"))
         duration_ms = cmd.get("duration_ms")
         min_total_ms = float(cmd.get("min_total_ms", 0.0))
         speed_factor = float(cmd.get("speed_factor", 1.0))
         min_dt = float(cmd.get("min_dt", 0.004))
         gap_rects = [tuple(map(int, r)) for r in (cmd.get("gap_rects") or [])]
-        gap_boost = float(cmd.get("gap_boost", 1.0))
+        gap_boost = max(0.05, float(cmd.get("gap_boost", 1.0)))
         line_jump_indices = [int(i) for i in (cmd.get("line_jump_indices") or [])]
-        line_jump_boost = float(cmd.get("line_jump_boost", 1.0))
+        line_jump_boost = max(0.05, float(cmd.get("line_jump_boost", 1.0)))
+        press = str(cmd.get("press", "none")).lower()
+        should_hold = press == "mouse"
 
-        times = self._build_times_for_path(
-            pts,
+        # Utrzymaj dokładnie tę samą trajektorię co hover JSON (bez retargetu biblioteki).
+        path_pts: List[Tuple[int, int]] = pts_raw[:]
+        if len(path_pts) < 2:
+            print("[Path] ignored: path too short")
+            return
+
+        line_jump_indices_expanded: List[int] = []
+        for idx in line_jump_indices:
+            if 0 <= idx < len(path_pts):
+                line_jump_indices_expanded.append(idx)
+
+        spacing_x = float(cmd.get("spacing_x", 1.0) or 1.0)
+        if spacing_x != 1.0 and len(path_pts) >= 2:
+            spaced_pts: List[Tuple[int, int]] = [path_pts[0]]
+            for i in range(1, len(path_pts)):
+                dx = (path_pts[i][0] - path_pts[i - 1][0]) * spacing_x
+                spaced_x = int(round(spaced_pts[i - 1][0] + dx))
+                spaced_pts.append((spaced_x, path_pts[i][1]))
+            path_pts = spaced_pts
+
+        times = self._build_times_for_path_smooth(
+            path_pts,
             speed=speed,
             duration_ms=duration_ms,
             min_total_ms=min_total_ms,
@@ -661,16 +1095,74 @@ class ControlAgent:
             min_dt=min_dt,
             gap_rects=gap_rects,
             gap_boost=gap_boost,
-            line_jump_indices=line_jump_indices,
+            line_jump_indices=line_jump_indices_expanded,
             line_jump_boost=line_jump_boost,
         )
-        pts_d, times_d = self._densify_linear(pts, times, fps=144)
+        # Densyfikacja po pikselu – maksymalnie ~1 px na krok.
+        pts_d, times_d = self._densify_by_pixel(path_pts, times, max_step_px=1.0)
+        # delikatny jitter także na ścieżkach hoverowych – zawsze, ale w małej amplitudzie
+        path_dist = _path_length([(float(x), float(y)) for x, y in path_pts])
+        jitter_amp = min(2.0, 0.015 * max(path_dist, 1.0))
+        pts_d = apply_micro_jitter(pts_d, max_jitter_px=jitter_amp, step_std=0.25)
+        pts_d = clamp_path(pts_d, margin=1)
+
+        speed_px_per_s = float(cmd.get("speed_px_per_s", 0.0) or 0.0)
+        if speed_px_per_s > 0.0 and times_d:
+            # Ogranicz do sensownego zakresu „ludzkich” prędkości.
+            speed_px_per_s = min(max(speed_px_per_s, 80.0), 2500.0)
+            total_len = _path_length([(float(x), float(y)) for x, y in pts_d])
+            if total_len > 0.0 and times_d[-1] > 1e-6:
+                # Docelowy czas = długość ścieżki / px_per_s, z dolnym limitem,
+                # żeby bardzo krótkie ruchy nie były „teleportem”.
+                target_T = max(0.15, total_len / speed_px_per_s)
+                scale_t = target_T / max(1e-6, times_d[-1])
+                times_d = [t * scale_t for t in times_d]
+
         if self.verbose:
             try:
-                print(f"[Path] steps={len(pts_d)} duration={times_d[-1]:.3f}s from=({pts_d[0][0]},{pts_d[0][1]}) to=({pts_d[-1][0]},{pts_d[-1][1]})")
+                print(
+                    f"[Path] points_in={len(pts_in)} expanded={len(path_pts)} densified={len(pts_d)} "
+                    f"duration={times_d[-1]:.3f}s press={press}"
+                )
             except Exception:
                 pass
-        self._run_timed_points(pts_d, times_d)
+
+        # Po skalowaniu: dbamy o monotoniczność czasów.
+        # Dla klasycznych ruchów trzymamy min_dt, dla trybu px/s pozwalamy na mniejsze kroki,
+        # żeby ruch nie był „tępy” i zbyt poszatkowany.
+        if times_d:
+            adj_times = [times_d[0]]
+            for i in range(1, len(times_d)):
+                dt = times_d[i] - times_d[i - 1]
+                if speed_px_per_s <= 0.0:
+                    dt = max(min_dt, dt)
+                else:
+                    dt = max(1e-4, dt)
+                adj_times.append(adj_times[-1] + dt)
+            times_d = adj_times
+
+        # Optional real-path visualisation: render on matching screenshot.
+        trace_stem = str(cmd.get("trace_stem") or "").strip()
+        if trace_stem:
+            def _safe_run(fn, *args):
+                try:
+                    fn(*args)
+                except Exception as e:  # pragma: no cover - tylko log
+                    try:
+                        print(f"[PathTrace] render failed: {e}")
+                    except Exception:
+                        pass
+            # Render mapę odwiedzin oraz mapę prędkości równolegle, bez blokowania ruchu.
+            threading.Thread(target=_safe_run, args=(self._render_hover_path, trace_stem, pts_d), daemon=True).start()
+            threading.Thread(target=_safe_run, args=(self._render_hover_speed, trace_stem, pts_d, times_d), daemon=True).start()
+
+        try:
+            if should_hold:
+                self.input_ctrl.press("mouse")
+            self._run_timed_points(pts_d, times_d)
+        finally:
+            if should_hold:
+                self.input_ctrl.release("mouse")
 
     def _cmd_move(self, cmd: Dict[str, Any]):
         """Obsługa komendy ruchu - UPROSZCZONE BEZ AUTO-SCROLLOWANIA"""
@@ -769,9 +1261,27 @@ class ControlAgent:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True, help="Config file (e.g. train.json)")
+    default_cfg = Path(__file__).resolve().parents[1] / "control_agent" / "train.json"
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=str(default_cfg),
+        help=f"Config file (e.g. train.json) (default: {default_cfg})",
+    )
     parser.add_argument("--port", type=int, default=8765, help="UDP port to listen on")
     parser.add_argument("--verbose", action="store_true", help="Verbose logging of actions and click coordinates")
+    parser.add_argument(
+        "--coords",
+        nargs=4,
+        type=int,
+        metavar=("X1", "Y1", "X2", "Y2"),
+        help="Optional manual path (x1 y1 x2 y2) to send once after agent start",
+    )
+    parser.add_argument(
+        "--left",
+        action="store_true",
+        help="Hold left mouse button for manual path.",
+    )
     args = parser.parse_args()
 
     try:
@@ -785,7 +1295,74 @@ def main():
         return
 
     agent = ControlAgent(cfg_path=args.config, udp_port=args.port, verbose=args.verbose)
-    agent.start()
+
+    if getattr(args, "coords", None) and agent.lib.samples:
+        x1, y1, x2, y2 = args.coords
+        sample = random.choice(agent.lib.samples)
+        pts = _align_path(sample["pts"], (x1, y1), (x2, y2))
+        command = {
+            "cmd": "path",
+            "points": [{"x": int(round(px)), "y": int(round(py))} for px, py in pts],
+            "min_dt": 0.01,
+        }
+        if args.left:
+            command["press"] = "mouse"
+            command["speed"] = "slow"
+        agent.cmd_queue.put(command)
+
+    if getattr(args, "coords", None):
+        x1, y1, x2, y2 = args.coords
+        command = {
+            "cmd": "path",
+            "points": [{"x": x1, "y": y1}, {"x": x2, "y": y2}],
+            "min_dt": 0.01,
+        }
+        if args.left:
+            command["press"] = "mouse"
+        agent.cmd_queue.put(command)
+
+    # Hard-exit listener on "}" key (and ] as fallback)
+    stop_evt = threading.Event()
+    def _on_press(key):
+        try:
+            ch = getattr(key, "char", None)
+            vk = getattr(key, "vk", None)
+            if ch and ch == "}":
+                print("[Agent] Hard exit requested via '}'")
+                stop_evt.set()
+                return False
+            if vk in (221,):  # ] / } on many layouts
+                print("[Agent] Hard exit requested via vk=221")
+                stop_evt.set()
+                return False
+        except Exception:
+            return False
+        return True
+
+    listener = keyboard.Listener(on_press=_on_press)
+    listener.daemon = True
+    listener.start()
+
+    def _run_agent():
+        agent.start()
+        stop_evt.set()
+
+    t = threading.Thread(target=_run_agent, name="ControlAgentMain", daemon=True)
+    t.start()
+
+    try:
+        while not stop_evt.is_set():
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            agent.receiver.stop_event.set()
+        except Exception:
+            pass
+        listener.stop()
+        t.join(timeout=1.0)
+        print("[Agent] Stopped (hard exit).")
 
 if __name__ == "__main__":
     main()

@@ -160,21 +160,28 @@ def human_scroll_mix(rec_dir: str, port_mouse: int, port_kbd: int, down=True, to
     time.sleep(random.uniform(0.05, 0.15))
 
 # ---------- Main actions ----------
-def paste_into_composer(rec_dir: str, port_mouse: int, port_kbd: int, input_hint: str, text: str):
-    clickables = load_clickables(rec_dir)
-    hit = match_clickable_by_hint(clickables, input_hint) if input_hint else None
-    if not hit:
-        # fallback: największy "textbox"-opodobny
-        candidates = []
-        for c in clickables:
-            role = (c.get("role") or "").lower()
-            tag = (c.get("tag") or "").lower()
-            if role in ("textbox",) or tag in ("textarea", "input"):
-                candidates.append(c)
-        if not candidates:
-            raise RuntimeError("Cannot locate ChatGPT input box")
-        hit = max(candidates, key=lambda c: (c["bbox"].get("width", 0), c["bbox"].get("center_y", 0)))
 
+def _wait_for_composer(rec_dir: str, input_hint: str, timeout_s: float = 120.0, poll_s: float = 0.5) -> Dict[str, Any]:
+    """Waits for composer (hint or textbox fallback)."""
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        clickables = load_clickables(rec_dir)
+        hit = match_clickable_by_hint(clickables, input_hint) if input_hint else None
+        if not hit:
+            candidates = []
+            for c in clickables:
+                role = (c.get("role") or "").lower()
+                tag = (c.get("tag") or "").lower()
+                if role in ("textbox",) or tag in ("textarea", "input"):
+                    candidates.append(c)
+            if candidates:
+                hit = max(candidates, key=lambda c: (c["bbox"].get("width", 0), c["bbox"].get("center_y", 0)))
+        if hit:
+            return hit
+        time.sleep(poll_s)
+    raise RuntimeError("Cannot locate ChatGPT input box (timeout)")
+def paste_into_composer(rec_dir: str, port_mouse: int, port_kbd: int, input_hint: str, text: str):
+    hit = _wait_for_composer(rec_dir, input_hint)
     x, y = random_point_in_bbox(hit["bbox"], jitter_ratio=0.22)
     send_mouse_move_click(port_mouse, x, y, speed="normal", min_total_ms=90.0)
     time.sleep(random.uniform(0.20, 0.35))

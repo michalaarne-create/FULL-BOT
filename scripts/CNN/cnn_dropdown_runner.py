@@ -33,7 +33,7 @@ import torch.nn.functional as F
 # ------------------ ŚCIEŻKI DOMYŚLNE (zmień jeśli chcesz) --------------------
 ROOT_PATH = Path(__file__).resolve().parents[2]
 ROOT = str(ROOT_PATH)
-JSON_DIR_DEFAULT   = str(ROOT_PATH / "data" / "screen" / "numpy_points" / "screen_boxes")
+JSON_DIR_DEFAULT   = str(ROOT_PATH / "data" / "screen" / "region_grow" / "region_grow")
 OUT_CROPS_DEFAULT  = str(ROOT_PATH / "data" / "screen" / "temp" / "OCR_boxes+10%")
 MODEL_PATH_DEFAULT = os.path.join(ROOT, "tri_cnn.pt")  # ścieżka do wytrenowanego modelu
 

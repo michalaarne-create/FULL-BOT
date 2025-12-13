@@ -61,6 +61,13 @@ async def main():
         default=None,
         help="Override browser User-Agent header/string"
     )
+    parser.add_argument(
+        "--extra-url",
+        dest="extra_urls",
+        action="append",
+        default=[],
+        help="Additional tab(s) to open on start (can be repeated)",
+    )
     parser.add_argument("--url", type=str, default=START_URL_DEFAULT)
     parser.add_argument("--fps", type=float, default=SNAPSHOT_FPS_DEFAULT)
     parser.add_argument(
@@ -68,6 +75,11 @@ async def main():
         type=str,
         default=None,
         help="Optional log file path (defaults to <output>/recorder_debug.log)",
+    )
+    parser.add_argument(
+        "--connect-existing",
+        action="store_true",
+        help="Attach to already running browser in user-data-dir (DevToolsActivePort) instead of launching new one",
     )
     screenshot_group = parser.add_mutually_exclusive_group()
     screenshot_group.add_argument(
@@ -151,9 +163,10 @@ async def main():
         fps=args.fps,
         screenshots=args.screenshots,
         verbose=args.verbose,
+        extra_urls=args.extra_urls,
         viewport_mode=args.viewport_mode,
         chrome_exe=args.chrome_exe,
-        connect_existing=bool(args.cdp_endpoint),
+        connect_existing=bool(args.cdp_endpoint) or bool(args.connect_existing),
         cdp_endpoint=args.cdp_endpoint,
         proxy_server=getattr(args, "proxy", None),
         enable_ocr=args.enable_ocr,

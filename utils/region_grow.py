@@ -1,6 +1,6 @@
 ﻿# -*- coding: utf-8 -*-
 """
-Dropdown / box detector (PaddleOCR 2.9.x) + lasery + trójkąty
+Dropdown / box detector (PaddleOCR 2.9.x) + lasery
 WSZYSTKIE OCR wykrycia + informacja o obramowaniu (4 lasery)
 """
 
@@ -8,15 +8,22 @@ WSZYSTKIE OCR wykrycia + informacja o obramowaniu (4 lasery)
 import os
 import sys
 from pathlib import Path
+import builtins
 
 ROOT_PATH = Path(__file__).resolve().parents[1]
 ROOT = str(ROOT_PATH)
 DATA_SCREEN_DIR = ROOT_PATH / "data" / "screen"
-RAW_SCREEN_DIR = DATA_SCREEN_DIR / "raw screen"
-DEFAULT_IMAGE_PATH = str(RAW_SCREEN_DIR / "Zrzut ekranu 2025-10-25 163249.png")
+RAW_SCREEN_DIR = DATA_SCREEN_DIR / "raw" / "raw screen"
+CURRENT_RUN_DIR = DATA_SCREEN_DIR / "current_run"
+DEFAULT_IMAGE_PATH = str(CURRENT_RUN_DIR / "screenshot.png")
+REGION_GROW_BASE = DATA_SCREEN_DIR / "region_grow"
+REGION_GROW_ANNOT_DIR = REGION_GROW_BASE / "region_grow_annot"
+REGION_GROW_ANNOT_CURRENT_DIR = REGION_GROW_BASE / "region_grow_annot_current"
+REGION_REGIONS_DIR = REGION_GROW_BASE / "regions"
+REGION_REGIONS_CURRENT_DIR = REGION_GROW_BASE / "regions_current"
+LEGACY_DEFAULT_IMAGE = str(RAW_SCREEN_DIR / "Zrzut ekranu 2025-10-25 163249.png")
 PADDLE_GPU_ID = int(os.environ.get("PADDLEOCR_GPU_ID", "0"))
 PADDLE_REC_BATCH = int(os.environ.get("PADDLEOCR_REC_BATCH", "16"))
-os.environ["CUDA_VISIBLE_DEVICES"] = str(PADDLE_GPU_ID)
 
 if hasattr(os, "add_dll_directory"):
     candidate_dirs = [
@@ -34,7 +41,7 @@ if hasattr(os, "add_dll_directory"):
 # === ŚCIEŻKI INTEGRACJI Z CNN ===
 
 # gdzie zapisujemy boxy dla CNN (UWAGA: nowa lokalizacja!)
-JSON_OUT_DIR = str(DATA_SCREEN_DIR / "region_grow")
+JSON_OUT_DIR = str(REGION_GROW_BASE / "region_grow")
 
 # runner (plik 1) który wytnie cropy +10% i puści inferencję
 CNN_RUNNER = str(ROOT_PATH / "utils" / "CNN" / "cnn_dropdown_runner.py")
@@ -55,12 +62,12 @@ SEED_PAD = 10
 FAST_OCR = False              # używaj rozbudowanego pipeline'u
 OCR_CONF_MIN = 0.01
 OCR_MAX_SIDE = 2800
-MAX_OCR_ITEMS = 400
+MAX_OCR_ITEMS = int(os.environ.get("REGION_GROW_MAX_OCR_ITEMS", "1200"))
 OCR_NMS_IOU = 0.60
 DB_THRESH = 0.12
 DB_BOX_THRESH = 0.32
 DB_UNCLIP = 1.45
-OCR_SCALES = [0.75, 1.0, 1.3, 1.6]            # kilka skal, by łapać mały tekst
+OCR_SCALES = [0.90, 1.05]            # kilka skal, by łapać mały tekst (szybciej)
 FORCE_DET_ONLY_IF_EMPTY_TEXT = True
 MIN_OCR_RESULTS = 5  # jeśli mniej wyników, dołóż fallback det-only
 RAPID_OCR_MAX_SIDE = int(os.environ.get("RAPID_OCR_MAX_SIDE", "800"))  # ogranicz rozdzielczość dla RapidOCR
@@ -74,6 +81,10 @@ RAPID_AUTOCROP_MIN_FG = float(os.environ.get("RAPID_OCR_AUTOCROP_MIN_FG", "0.002
 HIST_BITS_PER_CH = 4
 HIST_TOP_K = 8
 GLOBAL_BG_OVER_PCT = 0.50
+# Per-region background (layout) heuristics
+BG_REGION_MARGIN = 2
+BG_REGION_MIN_PIXELS = 32
+BG_CLUSTER_TOL_RGB = int(os.environ.get("RG_BG_CLUSTER_TOL", "24"))
 
 # Rysowanie
 OCR_BOX_COLOR = (0, 128, 255, 255)
@@ -91,35 +102,29 @@ EDGE_MAX_LEN_PX = 2000
 FRAME_SEARCH_MAX_PX = 500
 TEXT_MASK_DILATE = 1
 
-# Trójkąty
-ENABLE_TRIANGLE_DETECT = False  # wyłącz trójkąty (dużo przyspiesza)
-TRI_BITS = 4
-TRI_NEIGHBOR_QDIST = 1
-TRI_MIN_AREA = 40
-TRI_MIN_W = 6
-TRI_MIN_H = 6
-TRI_MIN_GEOM_AREA = 28.0
-TRI_FILL_RATIO = 0.72
-TRI_ISO_TOL = 0.08
-TRI_BG_DELTA_E = 8.0
-TRI_FILL_RGBA = (0, 255, 0, 70)
-TRI_EDGE_RGBA = (0, 160, 0, 230)
-TRI_EDGE_WIDTH = 3
-
 DEBUG_OCR = False
 ENABLE_TIMINGS = True
 TIMING_PREFIX = "[TIMER] "
+
+# Tryb szybkiego uruchomienia (ustaw RG_FAST=1 w środowisku).
+FAST_MODE = int(os.environ.get("RG_FAST", "0")) != 0
+# W trybie fast używamy jednej skali (szybciej).
+if FAST_MODE:
+    OCR_SCALES = [1.0]
 
 # ==============================================================================
 
 import contextlib
 import json
+import logging
 import os
 import subprocess, shutil
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import List, Tuple, Optional, Dict
+from collections import defaultdict
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -145,8 +150,13 @@ try:
     from cupyx.scipy import ndimage as cupy_ndimage  # type: ignore
 except Exception:
     cupy_ndimage = None
-USE_GPU_FLOOD = bool(int(os.environ.get("REGION_GROW_USE_GPU", "0")))
+USE_GPU_FLOOD = bool(int(os.environ.get("REGION_GROW_USE_GPU", "1")))
+# Jeśli wyłączysz fallback, wymagamy CuPy + cupyx.scipy.
+REQUIRE_GPU = bool(int(os.environ.get("REGION_GROW_REQUIRE_GPU", "1")))
+GPU_ARRAY_AVAILABLE = bool(USE_GPU_FLOOD and cp is not None)
 GPU_FLOOD_AVAILABLE = bool(USE_GPU_FLOOD and cp is not None and cupy_ndimage is not None)
+if REQUIRE_GPU and not GPU_FLOOD_AVAILABLE:
+    raise RuntimeError("REGION_GROW_REQUIRE_GPU=1, ale CuPy/cupyx.scipy.ndimage nie są dostępne – brak GPU flood fill")
 try:
     import psutil  # type: ignore
 except Exception:
@@ -156,46 +166,176 @@ try:
 except Exception:
     pynvml = None
 
-# OpenCV optymalizacja
-os.environ.setdefault("OMP_NUM_THREADS", str(max(1, (os.cpu_count() or 4)//2)))
-os.environ.setdefault("MKL_NUM_THREADS", os.environ["OMP_NUM_THREADS"])
-try:
-    cv2.setUseOptimized(True)
-    cv2.setNumThreads(max(1, os.cpu_count() or 1))
-except Exception:
-    pass
+# OpenCV optymalizacja + środowisko (jednorazowo)
+_env_initialized = False
+_env_lock = threading.Lock()
+VERBOSE = bool(int(os.environ.get("RG_VERBOSE", "0")))
 
-_K3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+
+def _filtered_print(*args, **kwargs):
+    if (not VERBOSE) and args and isinstance(args[0], str) and args[0].startswith("[DEBUG"):
+        return
+    builtins.print(*args, **kwargs)
+
+
+print = _filtered_print
+
+
+class _PpocrWarningFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        if "angle classifier" in msg and record.name.startswith("ppocr"):
+            return False
+        return True
+
+
+def _init_environment_once():
+    global _env_initialized
+    if _env_initialized:
+        return
+    with _env_lock:
+        if _env_initialized:
+            return
+        os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(PADDLE_GPU_ID))
+        os.environ.setdefault("PP_OCR_SHOW_LOG", "0")
+        logging.getLogger("ppocr").setLevel(logging.ERROR)
+        logging.getLogger("paddleocr").setLevel(logging.ERROR)
+        logging.getLogger("ppocr").addFilter(_PpocrWarningFilter())
+        os.environ.setdefault("OMP_NUM_THREADS", str(max(1, (os.cpu_count() or 4) // 2)))
+        os.environ.setdefault("MKL_NUM_THREADS", os.environ["OMP_NUM_THREADS"])
+        try:
+            cv2.setUseOptimized(True)
+            cv2.setNumThreads(max(1, os.cpu_count() or 1))
+        except Exception:
+            pass
+        _env_initialized = True
+
+
+_kernel_cache: Dict[Tuple[int, int], np.ndarray] = {}
+
+
+def _get_rect_kernel(ksize: Tuple[int, int]) -> np.ndarray:
+    key = (int(ksize[0]), int(ksize[1]))
+    cached = _kernel_cache.get(key)
+    if cached is not None:
+        return cached
+    ker = cv2.getStructuringElement(cv2.MORPH_RECT, key)
+    _kernel_cache[key] = ker
+    return ker
+
+
+_init_environment_once()
+_K3 = _get_rect_kernel((3, 3))
+_GPU_UNIFORM_KERNEL = cp.ones((23, 23), dtype=cp.float32) if GPU_ARRAY_AVAILABLE else None
+
+# =========== GPU utils (CupY) ===========
+def _resize_gpu(arr: np.ndarray, scale: float) -> np.ndarray:
+    if scale == 1.0:
+        return arr
+    if GPU_ARRAY_AVAILABLE:
+        try:
+            arr_cp = cp.asarray(arr)
+            res_cp = cupy_ndimage.zoom(arr_cp, (scale, scale, 1), order=1)
+            return cp.asnumpy(res_cp)
+        except Exception:
+            if REQUIRE_GPU:
+                raise
+    return cv2.resize(arr, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+
+
+def _gaussian_gpu(arr: np.ndarray, sigma: float) -> np.ndarray:
+    if GPU_ARRAY_AVAILABLE:
+        try:
+            arr_cp = cp.asarray(arr, dtype=cp.float32)
+            blur_cp = cupy_ndimage.gaussian_filter(arr_cp, sigma=(sigma, sigma, 0))
+            return cp.asnumpy(blur_cp.astype(cp.uint8))
+        except Exception:
+            if REQUIRE_GPU:
+                raise
+    return cv2.GaussianBlur(arr, (0, 0), sigma)
+
+
+def _adaptive_mean_thresh_gpu(gray: np.ndarray, block: int = 23, C: int = 15) -> np.ndarray:
+    """
+    Przybliżenie cv2.adaptiveThreshold na GPU: lokalna średnia - C.
+    """
+    if GPU_ARRAY_AVAILABLE:
+        try:
+            g = cp.asarray(gray, dtype=cp.float32)
+            k = _GPU_UNIFORM_KERNEL if _GPU_UNIFORM_KERNEL is not None else cp.ones((block, block), dtype=cp.float32)
+            mean = cupy_ndimage.convolve(g, k / float(block * block), mode="reflect")
+            bw = (g < (mean - float(C))).astype(cp.uint8) * 255
+            return cp.asnumpy(bw)
+        except Exception:
+            if REQUIRE_GPU:
+                raise
+    return cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, block, C)
 
 # ===================== Timer =====================
 class StageTimer:
+    __slots__ = ("enabled", "prefix", "_last", "_start", "records")
+
     def __init__(self, enabled=False, prefix=TIMING_PREFIX):
         self.enabled = enabled
         self.prefix = prefix
-        self._last = time.perf_counter()
-        self._start = self._last
+        if enabled:
+            now = time.perf_counter()
+            self._last = now
+            self._start = now
+        else:
+            self._last = 0.0
+            self._start = 0.0
+        self.records: list[dict] = []
     
     def mark(self, label: str):
-        if not self.enabled: return 0.0
+        if not self.enabled:
+            return 0.0
         now = time.perf_counter()
         dt = now - self._last
         print(f"{self.prefix}{label}: {dt*1000:.1f} ms")
         self._last = now
+        self.records.append({"label": label, "ms": dt * 1000.0})
         return dt
+
+    def add(self, label: str, dt_seconds: float):
+        if not self.enabled:
+            return
+        ms = dt_seconds * 1000.0
+        print(f"{self.prefix}{label}: {ms:.1f} ms")
+        self.records.append({"label": label, "ms": ms})
     
     def total(self, label: str = "TOTAL"):
         if not self.enabled: return 0.0
         now = time.perf_counter()
         dt = now - self._start
         print(f"{self.prefix}{label}: {dt*1000:.1f} ms")
+        self.records.append({"label": label, "ms": dt * 1000.0})
         return dt
+
+    def dump_json(self, path: str | Path):
+        try:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "enabled": self.enabled,
+                "records": self.records,
+                "total_ms": sum(rec["ms"] for rec in self.records),
+            }
+            Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
 # ===================== UTIL =====================
 def clamp(v, lo, hi): 
-    return max(lo, min(hi, v))
+    clipped = np.clip(v, lo, hi)
+    if isinstance(clipped, np.ndarray):
+        return clipped
+    try:
+        return clipped.item()
+    except Exception:
+        return clipped
 
 def rgb_to_lab(img_rgb: np.ndarray) -> np.ndarray:
-    return cv2.cvtColor(cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR), cv2.COLOR_BGR2LAB)
+    return cv2.cvtColor(np.ascontiguousarray(img_rgb), cv2.COLOR_RGB2LAB)
 
 def deltaE76(a: np.ndarray, b: np.ndarray) -> float:
     d = a.astype(np.int16) - b.astype(np.int16)
@@ -214,30 +354,59 @@ def iou_xyxy(a, b):
     return inter / float(ua + ub - inter + 1e-9)
 
 def suppress_ocr_overlaps(ocr_raw, iou_thr=OCR_NMS_IOU):
-    if not ocr_raw: return ocr_raw
-    
-    def box_from_quad(q):
+    if not ocr_raw:
+        return ocr_raw
+
+    boxes = []
+    quads = []
+    texts = []
+    confs = []
+
+    for q, t, c in ocr_raw:
         xs = [int(p[0]) for p in q]
         ys = [int(p[1]) for p in q]
-        return [min(xs), min(ys), max(xs), max(ys)]
-    
-    items = [(box_from_quad(q), q, t, c) for (q, t, c) in ocr_raw]
-    items.sort(key=lambda x: x[3], reverse=True)
-    
-    keep = []
-    used = [False] * len(items)
-    
-    for i, (b, q, t, c) in enumerate(items):
-        if used[i]: continue
-        keep.append((q, t, c))
-        for j in range(i+1, len(items)):
-            if not used[j] and iou_xyxy(b, items[j][0]) >= iou_thr:
-                used[j] = True
-    
-    return keep
+        boxes.append([min(xs), min(ys), max(xs), max(ys)])
+        quads.append(q)
+        texts.append(t)
+        confs.append(float(c))
+
+    boxes_np = np.asarray(boxes, dtype=np.float32)
+    order = np.argsort(np.asarray(confs, dtype=np.float32))[::-1]
+    boxes_np = boxes_np[order]
+    quads_sorted = [quads[i] for i in order]
+    texts_sorted = [texts[i] for i in order]
+    confs_sorted = [float(confs[i]) for i in order]
+
+    keep_idx: List[int] = []
+    idxs = np.arange(len(quads_sorted))
+    while idxs.size > 0:
+        i = idxs[0]
+        keep_idx.append(int(i))
+        if idxs.size == 1:
+            break
+        rest = idxs[1:]
+
+        xx1 = np.maximum(boxes_np[i, 0], boxes_np[rest, 0])
+        yy1 = np.maximum(boxes_np[i, 1], boxes_np[rest, 1])
+        xx2 = np.minimum(boxes_np[i, 2], boxes_np[rest, 2])
+        yy2 = np.minimum(boxes_np[i, 3], boxes_np[rest, 3])
+
+        w = np.maximum(0.0, xx2 - xx1)
+        h = np.maximum(0.0, yy2 - yy1)
+        inter = w * h
+
+        area_i = (boxes_np[i, 2] - boxes_np[i, 0]) * (boxes_np[i, 3] - boxes_np[i, 1])
+        area_rest = (boxes_np[rest, 2] - boxes_np[rest, 0]) * (boxes_np[rest, 3] - boxes_np[rest, 1])
+        union = area_i + area_rest - inter + 1e-9
+        iou = inter / union
+
+        idxs = rest[iou < iou_thr]
+
+    return [(quads_sorted[i], texts_sorted[i], confs_sorted[i]) for i in keep_idx]
 
 def color_close_rgb(a: np.ndarray, b: np.ndarray, tol: int = TOL_RGB) -> bool:
-    return bool(np.max(np.abs(a.astype(np.int16) - b.astype(np.int16))) <= tol)
+    diff = np.subtract(a, b, dtype=np.int16)
+    return bool(np.max(np.abs(diff)) <= tol)
 
 # Zamień funkcję to_py() na bezpieczniejszą wersję:
 def to_py(obj):
@@ -268,8 +437,29 @@ def to_py(obj):
     except (AttributeError, ValueError):
         return str(obj)
 
-# Zamień funkcję main() na tę z lepszym debugowaniem:
-def main():
+def _latest_image_in_dir(dir_path: Path) -> Optional[Path]:
+    exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+    if not dir_path.is_dir():
+        return None
+    files = [p for p in dir_path.iterdir() if p.is_file() and p.suffix.lower() in exts]
+    if not files:
+        return None
+    return max(files, key=lambda p: p.stat().st_mtime)
+
+def _resolve_default_image() -> str:
+    """Prefer the pipeline screenshot saved at start; fall back to legacy/raw images."""
+    candidates: List[Optional[Path]] = [
+        Path(DEFAULT_IMAGE_PATH),
+        Path(LEGACY_DEFAULT_IMAGE) if LEGACY_DEFAULT_IMAGE else None,
+        _latest_image_in_dir(RAW_SCREEN_DIR),
+    ]
+    for cand in candidates:
+        if cand and cand.exists():
+            return str(cand)
+    return DEFAULT_IMAGE_PATH
+
+# Debug entrypoint (single image with verbose diagnostics)
+def main_debug():
     print("="*60)
     print("[DEBUG] SCRIPT START")
     print("="*60)
@@ -277,7 +467,7 @@ def main():
     import sys
     
     try:
-        path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_IMAGE_PATH
+        path = sys.argv[1] if len(sys.argv) > 1 else _resolve_default_image()
         print(f"[DEBUG] Image path: {path}")
         
         if not os.path.isfile(path):
@@ -289,7 +479,7 @@ def main():
         print(f"[DEBUG] Detection returned {len(out.get('results', []))} results")
         
         print("[DEBUG] Creating annotation...")
-        out_path = annotate_and_save(path, out.get("results", []), out.get("triangles"), output_dir=JSON_OUT_DIR)
+        out_path = annotate_and_save(path, out.get("results", []), out.get("triangles"), output_dir=str(REGION_GROW_ANNOT_DIR))
         print(f"[DEBUG] Annotation created: {out_path}")
         
         print("\n[DEBUG] Converting to Python types...")
@@ -336,6 +526,8 @@ def main():
 _paddle = None
 _rapid = None
 _last_ocr_debug = {}
+_paddle_lock = threading.Lock()
+_rapid_lock = threading.Lock()
 
 def get_ocr():
     global _paddle
@@ -343,55 +535,41 @@ def get_ocr():
         return _paddle
 
     if paddle is None:
-        raise RuntimeError("Paddle is not available – cannot initialize PaddleOCR")
+        raise RuntimeError("Paddle is not available - cannot initialize PaddleOCR")
 
-    try:
-        print(f"[DEBUG] Paddle version: {getattr(paddle, '__version__', 'unknown')}")
-        print(f"[DEBUG] Paddle compiled with CUDA: {paddle.is_compiled_with_cuda()}")
-        try:
-            current_device = paddle.device.get_device()
-        except Exception:
-            current_device = "unknown"
-        print(f"[DEBUG] Paddle device before OCR init: {current_device}")
-        print(f"[DEBUG] CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}")
-    except Exception:
-        pass
+    _init_environment_once()
 
-    device_label = "cpu"
-    if paddle.is_compiled_with_cuda():
-        target_device = f"gpu:{PADDLE_GPU_ID}"
-        try:
+    with _paddle_lock:
+        if _paddle is not None:
+            return _paddle
+
+        # Prefer GPU; fail loudly if CUDA build unavailable
+        if paddle.is_compiled_with_cuda():
+            os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(PADDLE_GPU_ID))
+            target_device = f"gpu:{PADDLE_GPU_ID}"
             paddle.set_device(target_device)
             device_label = target_device
-        except Exception:
-            try:
-                paddle.set_device("gpu")
-                device_label = "gpu"
-            except Exception as exc:
-                print(f"[WARN] Could not set GPU device for PaddleOCR ({exc}), using CPU")
-                paddle.set_device("cpu")
-                device_label = "cpu"
-    else:
-        paddle.set_device("cpu")
-        device_label = "cpu"
+        else:
+            raise RuntimeError("Paddle installed without CUDA support - GPU OCR unavailable")
 
-    try:
-        _paddle = PaddleOCR(
-            lang="en",
-            use_textline_orientation=False,
-            text_recognition_batch_size=PADDLE_REC_BATCH,
-            use_gpu=paddle.is_compiled_with_cuda(),
-            gpu_id=PADDLE_GPU_ID,
-        )
         try:
-            device_now = paddle.device.get_device()
-        except Exception:
-            device_now = device_label
-        print(f"[DEBUG] PaddleOCR initialized on {device_now} (batch={PADDLE_REC_BATCH})")
-    except Exception as exc:
-        print(f"[ERROR] PaddleOCR initialization failed: {exc}")
-        _paddle = None
-        raise
+            _paddle = PaddleOCR(
+                lang="en",
+                use_textline_orientation=False,
+                text_recognition_batch_size=PADDLE_REC_BATCH,
+                use_gpu=True,
+                gpu_id=PADDLE_GPU_ID,
+                show_log=False,
+            )
+            try:
+                device_now = paddle.device.get_device()
+            except Exception:
+                device_now = device_label
+            print(f"[DEBUG] PaddleOCR initialized on {device_now} (batch={PADDLE_REC_BATCH})")
+        except Exception as exc:
+            print(f"[ERROR] PaddleOCR initialization failed: {exc}")
+            _paddle = None
+            raise
 
     return _paddle
 
@@ -401,67 +579,66 @@ def get_rapid_ocr():
         return _rapid
 
     if RapidOCR is None:
-        raise RuntimeError("RapidOCR (rapidocr_paddle) is not installed – cannot run OCR on GPU")
+        raise RuntimeError("RapidOCR (rapidocr_paddle) is not installed - cannot run OCR on GPU")
     if paddle is None:
-        raise RuntimeError("Paddle is not available – RapidOCR paddle backend cannot use GPU")
+        raise RuntimeError("Paddle is not available - RapidOCR paddle backend cannot use GPU")
 
-    try:
-        print(f"[DEBUG] Rapid/Paddle version: {getattr(paddle, '__version__', 'unknown')}")
-        print(f"[DEBUG] Rapid/Paddle compiled with CUDA: {paddle.is_compiled_with_cuda()}")
+    _init_environment_once()
+
+    with _rapid_lock:
+        if _rapid is not None:
+            return _rapid
+
+        if not paddle.is_compiled_with_cuda():
+            raise RuntimeError(
+                "Paddle used by RapidOCR is not compiled with CUDA - GPU OCR is not possible in this environment"
+            )
+
+        target_device = f"gpu:{PADDLE_GPU_ID}"
         try:
-            current_device = paddle.device.get_device()
+            paddle.device.set_device(target_device)
         except Exception:
-            current_device = "unknown"
-        print(f"[DEBUG] Rapid/Paddle device before init: {current_device}")
-        print(f"[DEBUG] CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}")
-    except Exception:
-        pass
+            try:
+                paddle.device.set_device("gpu")
+                target_device = "gpu"
+            except Exception as exc2:
+                raise RuntimeError(f"Failed to set Paddle device for RapidOCR to GPU ({target_device}): {exc2}") from exc2
 
-    if not paddle.is_compiled_with_cuda():
-        raise RuntimeError(
-            "Paddle used by RapidOCR is not compiled with CUDA – GPU OCR is not possible in this environment"
-        )
-
-    target_device = f"gpu:{PADDLE_GPU_ID}"
-    try:
-        paddle.device.set_device(target_device)
-    except Exception:
         try:
-            paddle.device.set_device("gpu")
-            target_device = "gpu"
-        except Exception as exc2:
-            raise RuntimeError(f"Failed to set Paddle device for RapidOCR to GPU ({target_device}): {exc2}") from exc2
-
-    try:
-        _rapid = RapidOCR(
-            det_use_cuda=True,
-            cls_use_cuda=True,
-            rec_use_cuda=True,
-            det_gpu_id=PADDLE_GPU_ID,
-            cls_gpu_id=PADDLE_GPU_ID,
-            rec_gpu_id=PADDLE_GPU_ID,
-        )
-        try:
-            device_now = paddle.device.get_device()
-        except Exception:
-            device_now = target_device
-        print(f"[DEBUG] RapidOCR (paddle) initialized on {device_now} (gpu_id={PADDLE_GPU_ID})")
-    except Exception as exc:
-        _rapid = None
-        raise RuntimeError(f"RapidOCR GPU initialization failed: {exc}") from exc
+            _rapid = RapidOCR(
+                det_use_cuda=True,
+                cls_use_cuda=True,
+                rec_use_cuda=True,
+                det_gpu_id=PADDLE_GPU_ID,
+                cls_gpu_id=PADDLE_GPU_ID,
+                rec_gpu_id=PADDLE_GPU_ID,
+            )
+            try:
+                device_now = paddle.device.get_device()
+            except Exception:
+                device_now = target_device
+            print(f"[DEBUG] RapidOCR (paddle) initialized on {device_now} (gpu_id={PADDLE_GPU_ID})")
+        except Exception as exc:
+            _rapid = None
+            raise RuntimeError(f"RapidOCR GPU initialization failed: {exc}") from exc
 
     return _rapid
 
 def _preprocess_for_ocr(img_pil: Image.Image):
     w, h = img_pil.size
     base_scale = 1.0
-    target_side = 1700
+    # Docelowy dłuższy bok dla OCR (można nadpisać RG_TARGET_SIDE)
+    target_side = int(os.environ.get("RG_TARGET_SIDE", "1024"))
     if max(w, h) < target_side:
         base_scale = target_side / float(max(w, h))
-    
-    tgt = img_pil.resize((int(w * base_scale), int(h * base_scale)), Image.BILINEAR)
-    arr0 = np.array(tgt)
-    
+
+    if base_scale != 1.0:
+        tgt = img_pil.resize((int(w * base_scale), int(h * base_scale)), Image.BILINEAR)
+    else:
+        tgt = img_pil
+
+    arr0 = np.ascontiguousarray(np.asarray(tgt.convert("RGB"), dtype=np.uint8))
+
     lab = cv2.cvtColor(arr0, cv2.COLOR_RGB2LAB)
     L, A, B = cv2.split(lab)
     L = cv2.createCLAHE(2.0, (8, 8)).apply(L)
@@ -475,19 +652,19 @@ def _prepare_rapid_image(arr: np.ndarray):
     Dla RapidOCR ogranicz rozdzielczość wejścia (dowolnie w dół),
     aby skrócić czas det+rec na dużych screenach.
     """
+    arr = np.ascontiguousarray(arr)
     h, w = arr.shape[:2]
     max_side = float(max(h, w))
     if max_side <= float(RAPID_OCR_MAX_SIDE):
         return arr, 1.0
     scale = float(RAPID_OCR_MAX_SIDE) / max_side
-    new_w = max(1, int(round(w * scale)))
-    new_h = max(1, int(round(h * scale)))
-    resized = cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    resized = _resize_gpu(arr, scale)
     return resized, scale
 
 def _auto_crop_for_rapid(arr: np.ndarray):
     if (not RAPID_OCR_AUTOCROP) or arr is None or arr.size == 0:
         return arr, (0, 0)
+    arr = np.ascontiguousarray(arr)
     h, w = arr.shape[:2]
     if h <= 0 or w <= 0:
         return arr, (0, 0)
@@ -590,13 +767,26 @@ def _tesseract_fallback(img_pil: Image.Image) -> List[Tuple[List[Tuple[int, int]
     return outs
 
 def _cv_text_regions(img_rgb: np.ndarray) -> List[List[Tuple[int, int]]]:
-    """Wykrywa prostokąty tekstu klasycznymi metodami CV (fallback gdy OCR nic nie widzi)."""
-    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
-    bw = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                               cv2.THRESH_BINARY_INV, 23, 15)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 3))
-    dil = cv2.dilate(bw, kernel, iterations=1)
+    """Wykrywa prostok?ty tekstu klasycznymi metodami CV (fallback gdy OCR nic nie widzi)."""
+    if not GPU_ARRAY_AVAILABLE and REQUIRE_GPU:
+        raise RuntimeError("GPU text regions wymagany (REGION_GROW_REQUIRE_GPU=1), brak CuPy")
+
+    if GPU_ARRAY_AVAILABLE:
+        img_cp = cp.asarray(img_rgb, dtype=cp.float32)
+        gray_cp = (0.299 * img_cp[..., 0] + 0.587 * img_cp[..., 1] + 0.114 * img_cp[..., 2])
+        blur_cp = cupy_ndimage.gaussian_filter(gray_cp, sigma=1.0)
+        gray_np = cp.asnumpy(cp.clip(blur_cp, 0, 255).astype(cp.uint8))
+        bw = _adaptive_mean_thresh_gpu(gray_np, 23, 15)
+        kernel = _get_rect_kernel((9, 3))
+        dil_gpu = _gpu_binary_dilate(bw, kernel, iterations=1)
+        dil = dil_gpu if dil_gpu is not None else cv2.dilate(bw, kernel, iterations=1)
+    else:
+        gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        bw = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                   cv2.THRESH_BINARY_INV, 23, 15)
+        kernel = _get_rect_kernel((9, 3))
+        dil = cv2.dilate(bw, kernel, iterations=1)
     contours, _ = cv2.findContours(dil, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     quads = []
     for cnt in contours:
@@ -617,22 +807,41 @@ def read_ocr_faster(img_pil: Image.Image, timer: Optional[StageTimer] = None):
     arr0, base_scale = _preprocess_for_ocr(img_pil)
     if timer: timer.mark("OCR preprocess")
     
+    t_init_start = time.perf_counter()
     ocr = get_ocr()
+    t_init = time.perf_counter() - t_init_start
+    if timer: timer.add("OCR init", t_init)
     det_quads = []
     
     # DET multi-scale
     print("[DEBUG] OCR: Detection phase...")
-    for s in OCR_SCALES:
+    def _det_scale(scale: float):
         try:
-            arr = cv2.resize(arr0, None, fx=s, fy=s, interpolation=cv2.INTER_LINEAR)
+            arr = _resize_gpu(arr0, scale)
             det = ocr.ocr(arr, det=True, rec=False, cls=False)
-            qlist = det[0] if isinstance(det, list) and len(det) else []
-            inv = 1.0 / (base_scale * s)
-            for q in qlist:
-                det_quads.append([(int(x*inv), int(y*inv)) for (x, y) in q])
-            print(f"[DEBUG] OCR: Scale {s} -> {len(qlist)} boxes")
-        except Exception as e:
-            print(f"[ERROR] OCR detection scale {s}: {e}")
+            return scale, det, None
+        except Exception as exc:
+            return scale, None, exc
+
+    scale_results = []
+    max_workers = min(len(OCR_SCALES), max(1, min(4, (os.cpu_count() or 2))))
+    if max_workers > 1:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            for fut in as_completed([ex.submit(_det_scale, s) for s in OCR_SCALES]):
+                scale_results.append(fut.result())
+    else:
+        for s in OCR_SCALES:
+            scale_results.append(_det_scale(s))
+
+    for s, det, err in sorted(scale_results, key=lambda x: x[0]):
+        if err is not None:
+            print(f"[ERROR] OCR detection scale {s}: {err}")
+            continue
+        qlist = det[0] if isinstance(det, list) and len(det) else []
+        inv = 1.0 / (base_scale * s)
+        for q in qlist:
+            det_quads.append([(int(x*inv), int(y*inv)) for (x, y) in q])
+        print(f"[DEBUG] OCR: Scale {s} -> {len(qlist)} boxes")
 
     if not det_quads:
         print("[DEBUG] OCR: No detections found")
@@ -688,7 +897,7 @@ def read_ocr_faster(img_pil: Image.Image, timer: Optional[StageTimer] = None):
         outs = outs[:MAX_OCR_ITEMS]
     
     print(f"[DEBUG] OCR: Final -> {len(outs)} results")
-    if timer: timer.mark("OCR finalize")
+    if timer: timer.mark("OCR fast total")
     return outs
 
 def read_ocr_full(img_pil: Image.Image, timer: Optional[StageTimer] = None):
@@ -697,7 +906,10 @@ def read_ocr_full(img_pil: Image.Image, timer: Optional[StageTimer] = None):
     arr0, base_scale = _preprocess_for_ocr(img_pil)
     if timer: timer.mark("OCR preprocess")
     
+    t_init_start = time.perf_counter()
     ocr = get_ocr()
+    t_init = time.perf_counter() - t_init_start
+    if timer: timer.add("OCR init", t_init)
     outs = []
     dbg = {
         "ppocr": "v4", 
@@ -712,23 +924,42 @@ def read_ocr_full(img_pil: Image.Image, timer: Optional[StageTimer] = None):
         "errors": []
     }
 
-    for s in OCR_SCALES:
+    def _rec_scale(scale: float):
         try:
-            arr = cv2.resize(arr0, None, fx=s, fy=s, interpolation=cv2.INTER_LINEAR)
+            arr = _resize_gpu(arr0, scale)
             res = ocr.ocr(arr, cls=True)
             lines = res[0] if isinstance(res, list) and len(res) > 0 else []
-            dbg["scales"].append({"scale": s, "raw": len(lines)})
-            inv = 1.0 / (base_scale * s)
-            for it in lines:
-                quad = it[0]
-                txt = (it[1][0] or "").strip()
-                conf = float(it[1][1] or 0.0)
-                quad = [(int(x * inv), int(y * inv)) for (x, y) in quad]
-                outs.append((quad, txt, conf))
-        except Exception as e:
-            dbg["errors"].append(f"rec_scale{s}: {e}")
+            return scale, lines, None
+        except Exception as exc:
+            return scale, None, exc
 
-    if timer: timer.mark("OCR full total")
+    t_ocr_start = time.perf_counter()
+    scale_results = []
+    max_workers = min(len(OCR_SCALES), max(1, min(4, (os.cpu_count() or 2))))
+    if max_workers > 1:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            for fut in as_completed([ex.submit(_rec_scale, s) for s in OCR_SCALES]):
+                scale_results.append(fut.result())
+    else:
+        for s in OCR_SCALES:
+            scale_results.append(_rec_scale(s))
+
+    for s, lines, err in sorted(scale_results, key=lambda x: x[0]):
+        if err is not None:
+            dbg["errors"].append(f"rec_scale{s}: {err}")
+            continue
+        dbg["scales"].append({"scale": s, "raw": len(lines)})
+        inv = 1.0 / (base_scale * s)
+        for it in lines:
+            quad = it[0]
+            txt = (it[1][0] or "").strip()
+            conf = float(it[1][1] or 0.0)
+            quad = [(int(x * inv), int(y * inv)) for (x, y) in quad]
+            outs.append((quad, txt, conf))
+
+    if timer:
+        timer.add("OCR infer", time.perf_counter() - t_ocr_start)
+        timer.mark("OCR full total")
 
     dbg["boxes_rec_raw"] = len(outs)
     has_text = any((t.strip() != "") for (_, t, _) in outs)
@@ -828,7 +1059,7 @@ def _to_quad_from_points(points):
     return None
 
 def read_ocr_rapid(img_pil: Image.Image, rapid_engine, timer: Optional[StageTimer] = None):
-    arr = np.array(img_pil)
+    arr = np.ascontiguousarray(np.array(img_pil))
     if arr is None or arr.size == 0:
         return []
     arr_cropped, (offset_x, offset_y) = _auto_crop_for_rapid(arr)
@@ -879,8 +1110,8 @@ def read_ocr_rapid(img_pil: Image.Image, rapid_engine, timer: Optional[StageTime
     return outs
 
 def read_ocr_wrapper(img_pil: Image.Image, timer: Optional[StageTimer] = None):
-    # Prefer RapidOCR if dostępne i włączone flagą środowiskową
-    use_rapid = bool(int(os.environ.get("REGION_GROW_USE_RAPID_OCR", "1")))
+    # Prefer PaddleOCR by default; RapidOCR only if explicitly enabled
+    use_rapid = bool(int(os.environ.get("REGION_GROW_USE_RAPID_OCR", "0")))
     if use_rapid:
         try:
             rapid = get_rapid_ocr()
@@ -903,7 +1134,7 @@ def _ocr_text_for_bbox(img_rgb: np.ndarray, bbox: Optional[List[int]], pad: int 
         return ""
     rapid = None
     ocr = None
-    use_rapid = bool(int(os.environ.get("REGION_GROW_USE_RAPID_OCR", "1")))
+    use_rapid = bool(int(os.environ.get("REGION_GROW_USE_RAPID_OCR", "0")))
     if use_rapid:
         try:
             rapid = get_rapid_ocr()
@@ -968,6 +1199,95 @@ def _ocr_text_for_bbox(img_rgb: np.ndarray, bbox: Optional[List[int]], pad: int 
         pass
     return ""
 
+def _ocr_text_for_bbox_batch(
+    img_rgb: np.ndarray,
+    bboxes: List[List[int]],
+    pad: int = 4,
+    min_conf: float = 0.2,
+    downscale_factor: float = 0.5,
+) -> List[str]:
+    """
+    Zbiorcze rozpoznawanie tekstu w wielu bboxach jednocze�nie.
+    - przyspiesza, bo wywo�ujemy PaddleOCR raz na batch listy crop�w
+    - dodatkowo ka�dy crop jest zmniejszany multiplikatywnie (scale < 1),
+      np. downscale_factor=0.5 zmniejsza szeroko�� i wysoko�� o po�ow�.
+    """
+    if not bboxes or img_rgb is None or img_rgb.size == 0:
+        return []
+
+    use_rapid = bool(int(os.environ.get("REGION_GROW_USE_RAPID_OCR", "0")))
+    # Dla RapidOCR na razie zachowujemy prosty per-box fallback,
+    # bo interfejs batchowy jest mniej stabilny ni� w PaddleOCR.
+    if use_rapid:
+        return [
+            _ocr_text_for_bbox(img_rgb, bbox, pad=pad, min_conf=min_conf)
+            for bbox in bboxes
+        ]
+
+    try:
+        ocr = get_ocr()
+    except Exception:
+        ocr = None
+    if ocr is None:
+        return ["" for _ in bboxes]
+
+    H, W = img_rgb.shape[:2]
+    crops: List[np.ndarray] = []
+    indices: List[int] = []
+
+    for idx, bbox in enumerate(bboxes):
+        if not bbox or len(bbox) != 4:
+            continue
+        x1, y1, x2, y2 = bbox
+        x1 = max(0, int(x1) - pad)
+        y1 = max(0, int(y1) - pad)
+        x2 = min(W, int(x2) + pad)
+        y2 = min(H, int(y2) + pad)
+        if x2 - x1 < 2 or y2 - y1 < 2:
+            continue
+
+        crop_rgb = img_rgb[y1:y2, x1:x2]
+        if crop_rgb is None or crop_rgb.size == 0:
+            continue
+
+        ch, cw = crop_rgb.shape[:2]
+        # Multiplikatywne zmniejszenie rozdzielczo�ci cropa
+        if downscale_factor > 0.0 and downscale_factor < 1.0:
+            new_w = max(2, int(round(cw * downscale_factor)))
+            new_h = max(2, int(round(ch * downscale_factor)))
+            if new_w < cw or new_h < ch:
+                crop_rgb = cv2.resize(crop_rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+        crops.append(crop_rgb)
+        indices.append(idx)
+
+    texts_out: List[str] = ["" for _ in bboxes]
+    if not crops:
+        return texts_out
+
+    try:
+        # PaddleOCR obs�uguje list� obraz�w jako batch. Dla batcha
+        # musimy wy��czy� detektor (det=False), inaczej zg�asza b��d.
+        res_batch = ocr.ocr(crops, det=False, rec=True, cls=True)
+    except Exception:
+        # awaryjnie wracamy do per-box
+        return [
+            _ocr_text_for_bbox(img_rgb, bbox, pad=pad, min_conf=min_conf)
+            for bbox in bboxes
+        ]
+
+    try:
+        for img_idx, img_res in enumerate(res_batch):
+            # wynik rec-only mo�e mie� kilka format�w, u�ywamy parsera pomocniczego
+            txt, conf = _parse_rec_result(img_res)
+            if txt and conf >= min_conf and img_idx < len(indices):
+                texts_out[indices[img_idx]] = txt
+    except Exception:
+        # w razie dziwnego formatu wyniku nic nie zmieniamy
+        return texts_out
+
+    return texts_out
+
 # ===================== MASKA TEKSTU =====================
 def build_text_mask_cv(ocr_items, W, H):
     m = np.zeros((H, W), np.uint8)
@@ -978,7 +1298,7 @@ def build_text_mask_cv(ocr_items, W, H):
         cv2.rectangle(m, (x1, y1), (min(W, x2+1), min(H, y2+1)), 1, thickness=-1)
     
     if TEXT_MASK_DILATE > 0:
-        k = cv2.getStructuringElement(cv2.MORPH_RECT, (1+2*TEXT_MASK_DILATE, 1+2*TEXT_MASK_DILATE))
+        k = _get_rect_kernel((1 + 2 * TEXT_MASK_DILATE, 1 + 2 * TEXT_MASK_DILATE))
         dil = _gpu_binary_dilate(m, k, iterations=1)
         if dil is not None:
             m = dil.astype(np.uint8)
@@ -993,43 +1313,172 @@ def quantize_rgb(img: np.ndarray, bits: int = HIST_BITS_PER_CH) -> np.ndarray:
 
 def hist_color_percent(img: np.ndarray, bits: int = HIST_BITS_PER_CH, top_k: int = HIST_TOP_K):
     uniq = cnt = None
-    if GPU_FLOOD_AVAILABLE:
+    max_bins = 1 << (3 * bits)
+    step = 256 // (1 << bits)
+    total = float(max(1, img.shape[0] * img.shape[1]))
+
+    if GPU_ARRAY_AVAILABLE:
         try:
             qg = (cp.asarray(img, dtype=cp.uint8) >> (8 - bits)).astype(cp.uint8)
-            keyg = (qg[...,0].astype(cp.uint32)<<(2*bits)) | (qg[...,1].astype(cp.uint32)<<bits) | qg[...,2].astype(cp.uint32)
-            flat = keyg.reshape(-1)
-            uniq_g, cnt_g = cp.unique(flat, return_counts=True)
-            uniq = cp.asnumpy(uniq_g)
-            cnt = cp.asnumpy(cnt_g)
+            keyg = (qg[..., 0].astype(cp.uint32) << (2 * bits)) | (qg[..., 1].astype(cp.uint32) << bits) | qg[..., 2].astype(cp.uint32)
+            flat_g = keyg.reshape(-1)
+            cnt_g = cp.bincount(flat_g, minlength=max_bins)
+            idx_g = cp.nonzero(cnt_g)[0]
+            uniq = cp.asnumpy(idx_g)
+            cnt = cp.asnumpy(cnt_g[idx_g])
         except Exception:
             uniq = cnt = None
+
     if uniq is None or cnt is None:
-        q = quantize_rgb(img, bits)
-        key = (q[...,0].astype(np.uint32)<<(2*bits)) | (q[...,1].astype(np.uint32)<<bits) | q[...,2].astype(np.uint32)
-        uniq, cnt = np.unique(key.reshape(-1), return_counts=True)
-    total = float(img.shape[0]*img.shape[1])
+        q = quantize_rgb(np.ascontiguousarray(img, dtype=np.uint8), bits)
+        key = (q[..., 0].astype(np.uint32) << (2 * bits)) | (q[..., 1].astype(np.uint32) << bits) | q[..., 2].astype(np.uint32)
+        flat = key.reshape(-1)
+        cnt_arr = np.bincount(flat, minlength=max_bins)
+        idx = np.nonzero(cnt_arr)[0]
+        cnt = cnt_arr[idx]
+        uniq = idx
+
     order = np.argsort(cnt)[::-1]
     uniq = uniq[order]
     cnt = cnt[order]
-    
+
     items = []
-    step = 256 // (1 << bits)
     for k_, c in zip(uniq[:top_k], cnt[:top_k]):
-        r = int(((k_>>(2*bits)) & ((1<<bits)-1)) * step + step//2)
-        g = int(((k_>>bits) & ((1<<bits)-1)) * step + step//2)
-        b = int((k_ & ((1<<bits)-1)) * step + step//2)
-        items.append({"rgb": [r, g, b], "pct": float(round(c/total, 6))})
-    
-    dom_pct = float(cnt[0]/total) if len(cnt) else 0.0
-    if len(uniq):
-        r0 = int(((uniq[0]>>(2*bits)) & ((1<<bits)-1)) * step + step//2)
-        g0 = int(((uniq[0]>>bits) & ((1<<bits)-1)) * step + step//2)
-        b0 = int((uniq[0] & ((1<<bits)-1)) * step + step//2)
+        r = int(((k_ >> (2 * bits)) & ((1 << bits) - 1)) * step + step // 2)
+        g = int(((k_ >> bits) & ((1 << bits) - 1)) * step + step // 2)
+        b = int((k_ & ((1 << bits) - 1)) * step + step // 2)
+        items.append({"rgb": [r, g, b], "pct": float(round(c / total, 6))})
+
+    if len(cnt):
+        dom_pct = float(cnt[0] / total)
+        r0 = int(((uniq[0] >> (2 * bits)) & ((1 << bits) - 1)) * step + step // 2)
+        g0 = int(((uniq[0] >> bits) & ((1 << bits) - 1)) * step + step // 2)
+        b0 = int((uniq[0] & ((1 << bits) - 1)) * step + step // 2)
         dom = [r0, g0, b0]
     else:
+        dom_pct = 0.0
         dom = [255, 255, 255]
-    
+
     return {"top": items, "dominant_pct": dom_pct, "dominant_rgb": dom}
+
+
+def _analyze_region_backgrounds(
+    img_rgb: np.ndarray,
+    text_mask: np.ndarray,
+    results: List[dict],
+    dominant_bg_rgb: np.ndarray,
+) -> dict:
+    """
+    Szacuje kolor tła osobno dla każdego wyniku OCR
+    i grupuje regiony w klastry tła (np. główna treść vs. pasek boczny).
+
+    Zwraca słownik z meta-danymi layoutu oraz uzupełnia każdy element
+    `results` o pola:
+      - bg_mean_rgb: [r,g,b] oszacowanego tła
+      - bg_dist_to_global: odległość koloru tła od globalnego tła
+      - bg_cluster_id: ID klastra tła
+      - bg_is_main_like: czy należy do klastra najbliższego globalnemu tle
+    """
+    H, W = img_rgb.shape[:2]
+    if not results:
+        return {"clusters": [], "main_cluster_id": None}
+
+    dom = np.asarray(dominant_bg_rgb, dtype=np.float32)
+
+    def _color_dist(a: np.ndarray, b: np.ndarray) -> float:
+        return float(np.max(np.abs(a.astype(np.float32) - b.astype(np.float32))))
+
+    cluster_colors: List[np.ndarray] = []
+    per_result: List[dict] = []
+
+    for idx, r in enumerate(results):
+        box = r.get("dropdown_box") or r.get("text_box")
+        if not box or len(box) != 4:
+            continue
+        try:
+            x1, y1, x2, y2 = [int(v) for v in box]
+        except Exception:
+            continue
+        x1 = clamp(x1 - BG_REGION_MARGIN, 0, W - 1)
+        x2 = clamp(x2 + BG_REGION_MARGIN, 1, W)
+        y1 = clamp(y1 - BG_REGION_MARGIN, 0, H - 1)
+        y2 = clamp(y2 + BG_REGION_MARGIN, 1, H)
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        region = img_rgb[y1:y2, x1:x2]
+        if region.size == 0:
+            continue
+
+        # Usuń piksele tekstu z próbkowania tła
+        text_roi = text_mask[y1:y2, x1:x2]
+        bg_mask = ~text_roi
+        if int(bg_mask.sum()) >= BG_REGION_MIN_PIXELS:
+            samples = region[bg_mask]
+        else:
+            samples = region.reshape(-1, 3)
+
+        if samples.size == 0:
+            continue
+
+        mean_rgb = samples.mean(axis=0).astype(np.float32)
+        dist_dom = _color_dist(mean_rgb, dom)
+
+        # Proste grupowanie po kolorze tła (maksymalna różnica w RGB)
+        cluster_id = None
+        for ci, ccol in enumerate(cluster_colors):
+            if _color_dist(mean_rgb, ccol) <= float(BG_CLUSTER_TOL_RGB):
+                cluster_id = ci
+                break
+        if cluster_id is None:
+            cluster_id = len(cluster_colors)
+            cluster_colors.append(mean_rgb)
+
+        info = {
+            "index": idx,
+            "mean_rgb": [int(round(float(mean_rgb[0]))),
+                         int(round(float(mean_rgb[1]))),
+                         int(round(float(mean_rgb[2])))],
+            "dist_to_global": float(round(dist_dom, 2)),
+            "cluster_id": int(cluster_id),
+        }
+        per_result.append(info)
+
+    clusters_meta: List[dict] = []
+    for ci, ccol in enumerate(cluster_colors):
+        members = [pr for pr in per_result if pr["cluster_id"] == ci]
+        if not members:
+            continue
+        clusters_meta.append(
+            {
+                "id": int(ci),
+                "mean_rgb": [
+                    int(round(float(ccol[0]))),
+                    int(round(float(ccol[1]))),
+                    int(round(float(ccol[2]))),
+                ],
+                "count": len(members),
+            }
+        )
+
+    main_cluster_id = None
+    if clusters_meta:
+        for cm in clusters_meta:
+            ccol = np.asarray(cm["mean_rgb"], dtype=np.float32)
+            cm["dist_to_global"] = float(round(_color_dist(ccol, dom), 2))
+        clusters_meta.sort(key=lambda c: c.get("dist_to_global", 0.0))
+        main_cluster_id = clusters_meta[0]["id"]
+
+    # Uzupełnij poszczególne wyniki o meta-dane tła
+    for info in per_result:
+        r = results[info["index"]]
+        r["bg_mean_rgb"] = info["mean_rgb"]
+        r["bg_dist_to_global"] = info["dist_to_global"]
+        r["bg_cluster_id"] = info["cluster_id"]
+        if main_cluster_id is not None:
+            r["bg_is_main_like"] = bool(info["cluster_id"] == main_cluster_id)
+
+    return {"clusters": clusters_meta, "main_cluster_id": main_cluster_id}
 
 # ===================== FLOOD i LASERY =====================
 def pick_seed(img_rgb: np.ndarray, text_box_xyxy: Tuple[int, int, int, int], pad: int = SEED_PAD):
@@ -1050,6 +1499,94 @@ def pick_seed(img_rgb: np.ndarray, text_box_xyxy: Tuple[int, int, int, int], pad
     cx = (x1 + x2)//2
     return cy, cx, img_rgb[cy, cx]
 
+
+def annotate_regions_and_save(image_path: str, results: List[dict]) -> None:
+    """
+    Domyślna wizualizacja regionów tła na podstawie bg_cluster_id.
+
+    - Korzysta z pól `bg_cluster_id` i `text_box`/`dropdown_box` w wynikach OCR.
+    - Dla każdego klastra rysuje duży prostokąt obejmujący wszystkie jego boxy.
+    - Zapisuje:
+        * historyczny plik w `REGION_REGIONS_DIR`,
+        * aktualny w `REGION_REGIONS_CURRENT_DIR/regions_current.png`.
+    """
+    try:
+        img = Image.open(image_path).convert("RGB")
+    except Exception as exc:
+        print(f"[WARN REGIONS] Could not open image for regions: {exc}")
+        return
+
+    W, H = img.size
+
+    clusters: Dict[int, Dict[str, int]] = {}
+    for r in results or []:
+        cid = r.get("bg_cluster_id")
+        if cid is None:
+            continue
+        try:
+            cid_int = int(cid)
+        except Exception:
+            continue
+        box = r.get("dropdown_box") or r.get("text_box")
+        if not box or len(box) != 4:
+            continue
+        try:
+            x1, y1, x2, y2 = [int(v) for v in box]
+        except Exception:
+            continue
+        x1 = clamp(x1, 0, W - 1)
+        y1 = clamp(y1, 0, H - 1)
+        x2 = clamp(x2, 1, W)
+        y2 = clamp(y2, 1, H)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        c = clusters.get(cid_int)
+        if c is None:
+            clusters[cid_int] = {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+        else:
+            c["x1"] = min(c["x1"], x1)
+            c["y1"] = min(c["y1"], y1)
+            c["x2"] = max(c["x2"], x2)
+            c["y2"] = max(c["y2"], y2)
+
+    if not clusters:
+        print("[DEBUG REGIONS] No bg_cluster_id metadata; skipping regions overlay.")
+        return
+
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    palette = [
+        (255, 0, 0),
+        (0, 128, 255),
+        (0, 200, 0),
+        (255, 165, 0),
+        (180, 0, 255),
+        (255, 0, 180),
+        (0, 255, 200),
+    ]
+
+    for idx, (cid, box) in enumerate(sorted(clusters.items())):
+        r, g, b = palette[idx % len(palette)]
+        fill = (r, g, b, 70)
+        edge = (r, g, b, 220)
+        x1, y1, x2, y2 = box["x1"], box["y1"], box["x2"], box["y2"]
+        draw.rectangle((x1, y1, x2, y2), fill=fill, outline=edge, width=3)
+
+    out = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+
+    try:
+        REGION_REGIONS_DIR.mkdir(parents=True, exist_ok=True)
+        REGION_REGIONS_CURRENT_DIR.mkdir(parents=True, exist_ok=True)
+        base_name = os.path.splitext(os.path.basename(image_path))[0]
+        hist_path = REGION_REGIONS_DIR / f"{base_name}_regions.png"
+        current_path = REGION_REGIONS_CURRENT_DIR / "regions_current.png"
+        out.save(hist_path)
+        out.save(current_path)
+        print(f"[DEBUG REGIONS] Saved regions: hist={hist_path} current={current_path}")
+    except Exception as exc:
+        print(f"[WARN REGIONS] Failed to save regions overlays: {exc}")
+
 def _extract_roi_patch(img_rgb: np.ndarray, seed_y: int, seed_x: int, radius: int):
     H, W = img_rgb.shape[:2]
     ry1, ry2 = max(0, seed_y-radius), min(H, seed_y+radius+1)
@@ -1060,11 +1597,12 @@ def _extract_roi_patch(img_rgb: np.ndarray, seed_y: int, seed_x: int, radius: in
     return roi, ry1, rx1, seed_y - ry1, seed_x - rx1
 
 def _run_cv_floodfill(roi: np.ndarray, rel_y: int, rel_x: int, tol_rgb: int, neighbor8: bool):
-    mask = np.zeros((roi.shape[0]+2, roi.shape[1]+2), np.uint8)
+    roi_c = np.ascontiguousarray(roi)
+    mask = np.zeros((roi_c.shape[0] + 2, roi_c.shape[1] + 2), np.uint8)
     flags = ((8 if neighbor8 else 4) | cv2.FLOODFILL_MASK_ONLY | cv2.FLOODFILL_FIXED_RANGE)
     try:
         _, _, _, rect = cv2.floodFill(
-            roi, mask, (int(rel_x), int(rel_y)), newVal=(0, 0, 0),
+            roi_c, mask, (int(rel_x), int(rel_y)), newVal=(0, 0, 0),
             loDiff=(tol_rgb,)*3, upDiff=(tol_rgb,)*3, flags=flags
         )
     except Exception:
@@ -1074,28 +1612,29 @@ def _run_cv_floodfill(roi: np.ndarray, rel_y: int, rel_x: int, tol_rgb: int, nei
     return mask[1:-1, 1:-1].astype(bool), rect
 
 def _finalize_region_mask(region_small: np.ndarray, ry1: int, rx1: int, img_shape: Tuple[int, int, int]):
-    region_big = np.zeros(img_shape[:2], np.uint8)
+    """
+    Szybkie wyprowadzenie maski regionu i bboxa:
+    - pracujemy tylko na lokalnej masce region_small (ROI),
+    - unikamy kosztownego domykania morfologicznego na całym obrazie.
+    """
     h, w = region_small.shape
-    region_big[ry1:ry1+h, rx1:rx1+w] = region_small.astype(np.uint8)
-    closed = _gpu_binary_closing(region_big, _K3, iterations=1)
-    if closed is not None:
-        region_big = (closed > 0).astype(np.uint8)
-    else:
-        region_big = cv2.morphologyEx(region_big, cv2.MORPH_CLOSE, _K3, iterations=1)
-    ys, xs = np.where(region_big > 0)
+    ys, xs = np.where(region_small)
     if ys.size == 0 or xs.size == 0:
         return None
-    y1b, y2b = int(ys.min()), int(ys.max())
-    x1b, x2b = int(xs.min()), int(xs.max())
-    bbox_xyxy = (x1b, y1b, x2b+1, y2b+1)
+    y1b, y2b = int(ys.min()) + ry1, int(ys.max()) + ry1
+    x1b, x2b = int(xs.min()) + rx1, int(xs.max()) + rx1
+    bbox_xyxy = (x1b, y1b, x2b + 1, y2b + 1)
+
+    region_big = np.zeros(img_shape[:2], np.uint8)
+    region_big[ry1:ry1 + h, rx1:rx1 + w] = region_small.astype(np.uint8)
     return region_big.astype(bool), bbox_xyxy
 
 def _gpu_binary_closing(mask: np.ndarray, kernel: np.ndarray, iterations: int = 1):
     if not GPU_FLOOD_AVAILABLE:
         return None
     try:
-        arr = cp.asarray(mask.astype(np.uint8))
-        ker = cp.asarray(kernel.astype(np.uint8))
+        arr = cp.asarray(mask, dtype=cp.uint8)
+        ker = cp.asarray(kernel, dtype=cp.uint8)
         res = cupy_ndimage.binary_closing(arr, structure=ker, iterations=iterations)
         return cp.asnumpy(res)
     except Exception:
@@ -1105,8 +1644,8 @@ def _gpu_binary_dilate(mask: np.ndarray, kernel: np.ndarray, iterations: int = 1
     if not GPU_FLOOD_AVAILABLE:
         return None
     try:
-        arr = cp.asarray(mask.astype(np.uint8))
-        ker = cp.asarray(kernel.astype(np.uint8))
+        arr = cp.asarray(mask, dtype=cp.uint8)
+        ker = cp.asarray(kernel, dtype=cp.uint8)
         res = cupy_ndimage.binary_dilation(arr, structure=ker, iterations=iterations)
         return cp.asnumpy(res)
     except Exception:
@@ -1165,14 +1704,20 @@ def flood_same_color_bbox_cv(img_rgb: np.ndarray, seed_y: int, seed_x: int,
     r = radius if radius is not None else BASE_RADIUS
     if bbox_hint is not None:
         r = _estimate_radius(bbox_hint)
+    if REQUIRE_GPU and not GPU_FLOOD_AVAILABLE:
+        raise RuntimeError("GPU flood fill wymagany (REGION_GROW_REQUIRE_GPU=1), ale CuPy niedostępny")
     if GPU_FLOOD_AVAILABLE:
         gpu_result = flood_region_gpu(img_rgb, seed_y, seed_x, tol_rgb, r, neighbor8)
         if gpu_result is not None:
             return gpu_result
+    if REQUIRE_GPU:
+        raise RuntimeError("GPU flood fill zwrócił None – brak CPU fallback (REQUIRE_GPU=1)")
     return flood_region_cpu(img_rgb, seed_y, seed_x, tol_rgb, r, neighbor8)
 
 def boundary_colors_from_region_fast(img_rgb: np.ndarray, region_mask: np.ndarray,
                                      text_mask: np.ndarray, tol_rgb: int = TOL_RGB) -> Dict[str, dict]:
+    if REQUIRE_GPU and not GPU_ARRAY_AVAILABLE:
+        raise RuntimeError("GPU boundary colors wymagany (REGION_GROW_REQUIRE_GPU=1), ale CuPy niedostępny")
     H, W = region_mask.shape
     ys, xs = np.where(region_mask)
     if ys.size == 0: return {}
@@ -1186,6 +1731,8 @@ def boundary_colors_from_region_fast(img_rgb: np.ndarray, region_mask: np.ndarra
     gpu_res = _boundary_colors_gpu(sub, reg, txt, tol_rgb, y1, x1)
     if gpu_res is not None:
         return gpu_res
+    if REQUIRE_GPU:
+        raise RuntimeError("GPU boundary colors zwrócił None – brak CPU fallback (REQUIRE_GPU=1)")
 
     rim = cv2.dilate(reg.astype(np.uint8), _K3, iterations=1).astype(bool)
     rim = rim & (~reg) & (~txt)
@@ -1199,49 +1746,30 @@ def boundary_colors_from_region_fast(img_rgb: np.ndarray, region_mask: np.ndarra
     if gpu_clusters is not None:
         return gpu_clusters
 
-    s = tol_rgb + 1
-    keys = (cols // s).astype(np.int16)
-    clusters = []
-    bucket = {}
-
-    for i, c in enumerate(cols):
-        k = (int(keys[i,0]), int(keys[i,1]), int(keys[i,2]))
-        matched = False
-        
-        for dr in (-1, 0, 1):
-            for dg in (-1, 0, 1):
-                for db in (-1, 0, 1):
-                    lst = bucket.get((k[0]+dr, k[1]+dg, k[2]+db))
-                    if not lst:
-                        continue
-                    for ci in lst:
-                        rc = clusters[ci]["rgb"]
-                        if np.max(np.abs(c.astype(np.int16) - rc.astype(np.int16))) <= tol_rgb:
-                            clusters[ci]["count"] += 1
-                            matched = True
-                            break
-                    if matched: break
-                if matched: break
-            if matched: break
-        
-        if not matched:
-            ci = len(clusters)
-            clusters.append({"rgb": c.copy(), "count": 1, "pos": (int(posy[i]), int(posx[i]))})
-            bucket.setdefault(k, []).append(ci)
+    step = int(tol_rgb + 1)
+    quant = (cols // step).astype(np.int16)
+    key = (quant[:, 0].astype(np.int32) << 16) | (quant[:, 1].astype(np.int32) << 8) | quant[:, 2].astype(np.int32)
+    uniq, idx, counts = np.unique(key, return_index=True, return_counts=True)
+    order = np.argsort(counts)[::-1]
+    uniq = uniq[order]
+    idx = idx[order]
+    counts = counts[order]
 
     out = {}
-    for cl in clusters:
-        r, g, b = int(cl["rgb"][0]), int(cl["rgb"][1]), int(cl["rgb"][2])
-        out[f"{r},{g},{b}"] = {
-            "rgb": [r, g, b], 
-            "count": int(cl["count"]),
-            "sample_pos": [cl["pos"][0], cl["pos"][1]]
+    for k_, i_, c_ in zip(uniq, idx, counts):
+        rgb = cols[int(i_)]
+        y = int(posy[int(i_)])
+        x = int(posx[int(i_)])
+        key_str = f"{int(rgb[0])},{int(rgb[1])},{int(rgb[2])}"
+        out[key_str] = {
+            "rgb": [int(rgb[0]), int(rgb[1]), int(rgb[2])],
+            "count": int(c_),
+            "sample_pos": [y, x],
         }
-    
     return out
 
 def _cluster_boundary_colors_gpu(cols: np.ndarray, posy: np.ndarray, posx: np.ndarray, tol_rgb: int):
-    if not GPU_FLOOD_AVAILABLE or cols.size == 0:
+    if not GPU_ARRAY_AVAILABLE or cols.size == 0:
         return None
     try:
         cg = cp.asarray(cols.astype(np.uint8))
@@ -1273,7 +1801,7 @@ def _cluster_boundary_colors_gpu(cols: np.ndarray, posy: np.ndarray, posx: np.nd
 
 def _boundary_colors_gpu(sub: np.ndarray, reg: np.ndarray, txt: np.ndarray,
                          tol_rgb: int, offset_y: int, offset_x: int):
-    if not GPU_FLOOD_AVAILABLE:
+    if not GPU_ARRAY_AVAILABLE:
         return None
     try:
         reg_gpu = cp.asarray(reg.astype(bool))
@@ -1325,7 +1853,7 @@ def region_ref_lab(lab_img: np.ndarray, region_mask: np.ndarray) -> np.ndarray:
     return np.median(lab_img[ys, xs], axis=0).astype(np.uint8)
 
 def _deltaE_map(lab_win: np.ndarray, ref_lab: np.ndarray) -> np.ndarray:
-    if GPU_FLOOD_AVAILABLE:
+    if GPU_ARRAY_AVAILABLE:
         try:
             lw = cp.asarray(lab_win.astype(np.int16))
             ref = cp.asarray(ref_lab.reshape(1, 1, 3).astype(np.int16))
@@ -1489,7 +2017,7 @@ def _laser_cast_gpu(dy: int, dx: int, start_y: int, start_x: int, region_gpu, te
 
 def _laser_box_check_gpu(img_rgb: np.ndarray, lab_img: np.ndarray, bbox_text,
                          region_mask, frame_rgb, text_mask, tol_rgb: int):
-    if not GPU_FLOOD_AVAILABLE:
+    if not GPU_ARRAY_AVAILABLE:
         return None
     x1, y1, x2, y2 = bbox_text
     cy, cx = (y1+y2)//2, (x1+x2)//2
@@ -1540,111 +2068,22 @@ def laser_box_check_fast(img_rgb: np.ndarray, lab_img: np.ndarray, bbox_text,
             return gpu_result
     return _laser_box_check_cpu(img_rgb, lab_img, bbox_text, region_mask, frame_rgb, text_mask, tol_rgb)
 
-# ===================== TRIANGLES ===============================================
-def _tri_quantize(img: np.ndarray, bits: int):
-    q = (img >> (8 - bits)).astype(np.uint8)
-    return q, q[...,0], q[...,1], q[...,2]
-
-def _tri_bin_center_rgb(bin_r: int, bin_g: int, bin_b: int, bits: int):
-    step = 256 // (1 << bits)
-    return (bin_r*step + step//2, bin_g*step + step//2, bin_b*step + step//2)
-
-def _is_isosceles(pts: np.ndarray, rel_tol: float) -> bool:
-    if pts.shape[0] != 3: return False
-    
-    def sq(a, b): 
-        return (a[0]-b[0])**2 + (a[1]-b[1])**2
-    
-    d = [sq(pts[0], pts[1]), sq(pts[1], pts[2]), sq(pts[2], pts[0])]
-    if min(d) == 0: return False
-    
-    def close(u, v): 
-        return abs(u-v) <= rel_tol*max(u, v)
-    
-    return close(d[0], d[1]) or close(d[1], d[2]) or close(d[0], d[2])
-
-def find_filled_isosceles_triangles_fast(
-    img_rgb: np.ndarray,
-    lab_img: np.ndarray,
-    bg_rgb: Tuple[int,int,int],
-    bits: int = TRI_BITS,
-    neighbor_qdist: int = TRI_NEIGHBOR_QDIST,
-    min_area: int = TRI_MIN_AREA,
-    min_w: int = TRI_MIN_W,
-    min_h: int = TRI_MIN_H,
-    min_geom_area: float = TRI_MIN_GEOM_AREA,
-    fill_ratio: float = TRI_FILL_RATIO,
-    iso_tol: float = TRI_ISO_TOL,
-    bg_delta_e: float = TRI_BG_DELTA_E
-) -> List[Dict]:
-    bg_lab = cv2.cvtColor(np.uint8([[[bg_rgb[0], bg_rgb[1], bg_rgb[2]]]]), cv2.COLOR_RGB2LAB)[0, 0]
-
-    q, qR, qG, qB = _tri_quantize(img_rgb, bits)
-    key = (qR.astype(np.uint32)<<(2*bits)) | (qG.astype(np.uint32)<<bits) | qB.astype(np.uint32)
-    uniq, cnt = np.unique(key.reshape(-1), return_counts=True)
-
-    cand_bins = []
-    for k_, c in zip(uniq, cnt):
-        if c < max(8, min_area//2): continue
-        br = int((k_>>(2*bits)) & ((1<<bits)-1))
-        bg_ = int((k_>>bits) & ((1<<bits)-1))
-        bb = int(k_ & ((1<<bits)-1))
-        cr, cg, cb = _tri_bin_center_rgb(br, bg_, bb, bits)
-        col_lab = cv2.cvtColor(np.uint8([[[cr, cg, cb]]]), cv2.COLOR_RGB2LAB)[0, 0]
-        if deltaE76(col_lab, bg_lab) <= bg_delta_e:
-            continue
-        cand_bins.append((br, bg_, bb))
-
-    diff = lab_img.astype(np.int16) - bg_lab.reshape(1,1,3).astype(np.int16)
-    d2 = (diff * diff).sum(axis=2).astype(np.int32)
-    thr2 = float(bg_delta_e) * float(bg_delta_e)
-    not_bg = (d2 > thr2).astype(np.uint8)
-
-    results = []
-    for br, bg__, bb in cand_bins:
-        mr = (np.abs(qR.astype(np.int16) - br) <= neighbor_qdist)
-        mg = (np.abs(qG.astype(np.int16) - bg__) <= neighbor_qdist)
-        mb = (np.abs(qB.astype(np.int16) - bb) <= neighbor_qdist)
-        mask = (mr & mg & mb).astype(np.uint8)
-        mask = (mask & not_bg)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _K3, iterations=1)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, _K3, iterations=1)
-
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours: continue
-
-        for cnt_ in contours:
-            area_pix = cv2.contourArea(cnt_)
-            if area_pix < min_area: continue
-            x, y, w, h = cv2.boundingRect(cnt_)
-            if w < min_w or h < min_h: continue
-            hull = cv2.convexHull(cnt_)
-            peri = cv2.arcLength(hull, True)
-            approx = cv2.approxPolyDP(hull, 0.04*peri, True)
-            if approx.shape[0] != 3: continue
-            tri = approx.reshape(-1, 2)
-            area_geom = cv2.contourArea(approx)
-            if area_geom <= min_geom_area or area_geom <= 0: continue
-            if (area_pix / (area_geom + 1e-9)) < fill_ratio: continue
-            if not _is_isosceles(tri, rel_tol=iso_tol): continue
-            cr, cg, cb = _tri_bin_center_rgb(br, bg__, bb, bits)
-            results.append({
-                "color": [int(cr), int(cg), int(cb)],
-                "hull": [(int(tri[0][0]), int(tri[0][1])),
-                        (int(tri[1][0]), int(tri[1][1])),
-                        (int(tri[2][0]), int(tri[2][1]))],
-                "bbox": (int(x), int(y), int(x+w), int(y+h)),
-                "area_pixels": float(area_pix),
-                "area_geom": float(area_geom),
-                "fill_ratio": float(area_pix/(area_geom+1e-9)),
-            })
-    
-    return results
-
 # ===================== PIPELINE =================================================
 def run_dropdown_detection(image_path: str) -> dict:
     print(f"[DEBUG] Starting detection: {image_path}")
     timer = StageTimer(ENABLE_TIMINGS)
+
+    # Info o GPU/CPU na starcie
+    try:
+        import paddle  # type: ignore
+        paddle_cuda = bool(paddle.is_compiled_with_cuda())
+    except Exception:
+        paddle_cuda = False
+    print(
+        f"[DEBUG] GPU flood available={GPU_FLOOD_AVAILABLE} "
+        f"use_gpu_flood={USE_GPU_FLOOD} "
+        f"paddle_cuda={paddle_cuda}"
+    )
 
     print("[DEBUG] Loading image...")
     img_pil = Image.open(image_path).convert("RGB")
@@ -1677,24 +2116,26 @@ def run_dropdown_detection(image_path: str) -> dict:
     text_mask = build_text_mask_cv(ocr_raw, W, H)
     timer.mark("Text mask")
 
-    detection_stats: Dict[str, float] = {}
-    detection_counts: Dict[str, int] = {}
+    detection_stats: Dict[str, float] = defaultdict(float)
+    detection_counts: Dict[str, int] = defaultdict(int)
+    stat_lock = threading.Lock()
 
     def _stat_add(label: str, duration: float):
         if not ENABLE_TIMINGS or duration <= 0:
             return
-        detection_stats[label] = detection_stats.get(label, 0.0) + duration
-        detection_counts[label] = detection_counts.get(label, 0) + 1
+        with stat_lock:
+            detection_stats[label] += duration
+            detection_counts[label] += 1
 
-    results = []
+    results: List[dict] = []
 
     print(f"[DEBUG] Processing {len(ocr_raw)} detections...")
-    for idx, (quad, txt, conf) in enumerate(ocr_raw):
+
+    def _process_detection(idx: int, quad, txt, conf):
         xs = [int(p[0]) for p in quad]
         ys = [int(p[1]) for p in quad]
         x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
 
-        # Podstawowy wynik
         result = {
             "text": txt,
             "conf": float(conf),
@@ -1703,48 +2144,66 @@ def run_dropdown_detection(image_path: str) -> dict:
             "frame_hits": 0,
             "dropdown_box": None,
             "frame_rgb": None,
-            "laser_endpoints": None
+            "laser_endpoints": None,
         }
 
         try:
-            t_seed = time.perf_counter()
-            sy, sx, _ = pick_seed(img, (x1, y1, x2, y2), pad=SEED_PAD)
-            _stat_add("seed", time.perf_counter() - t_seed)
-            t_flood = time.perf_counter()
-            est_radius = _estimate_radius((x1, y1, x2, y2))
-            ff = flood_same_color_bbox_cv(
-                img, sy, sx, bbox_hint=(x1, y1, x2, y2),
-                tol_rgb=TOL_RGB, radius=est_radius, neighbor8=NEIGHBOR_8
-            )
-            
-            if ff is None:
-                cy, cx = (y1+y2)//2, (x1+x2)//2
-                ff = flood_same_color_bbox_cv(
-                    img, cy, cx, bbox_hint=(x1, y1, x2, y2),
-                    tol_rgb=TOL_RGB, radius=est_radius, neighbor8=NEIGHBOR_8
-                )
-            _stat_add("flood", time.perf_counter() - t_flood)
+            # 1D lasery od środka boxa – BEZ floodfill
+            t_laser = time.perf_counter()
+            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+            ends = [
+                _ray_stop_on_edge(lab, text_mask, cx, cy, +1, 0),  # prawo
+                _ray_stop_on_edge(lab, text_mask, cx, cy, -1, 0),  # lewo
+                _ray_stop_on_edge(lab, text_mask, cx, cy, 0, -1),  # góra
+                _ray_stop_on_edge(lab, text_mask, cx, cy, 0, +1),  # dół
+            ]
+            _stat_add("laser", time.perf_counter() - t_laser)
 
-            if ff is not None:
-                region_mask, flood_bbox = ff
-                t_boundary = time.perf_counter()
-                bcolors = boundary_colors_from_region_fast(img, region_mask, text_mask, tol_rgb=TOL_RGB)
-                frame_rgb = None if not bcolors else np.array(max(bcolors.values(), key=lambda v: v["count"])["rgb"], dtype=np.uint8)
-                _stat_add("boundary", time.perf_counter() - t_boundary)
-                t_laser = time.perf_counter()
-                hits, endpoints = laser_box_check_fast(img, lab, (x1, y1, x2, y2), region_mask, frame_rgb, text_mask, TOL_RGB)
-                _stat_add("laser", time.perf_counter() - t_laser)
-                
-                result["dropdown_box"] = [int(flood_bbox[0]), int(flood_bbox[1]), int(flood_bbox[2]), int(flood_bbox[3])]
-                result["frame_rgb"] = [int(frame_rgb[0]), int(frame_rgb[1]), int(frame_rgb[2])] if frame_rgb is not None else None
-                result["frame_hits"] = int(hits)
-                result["has_frame"] = (hits == 4)
-                result["laser_endpoints"] = [[int(px), int(py)] for (px, py) in endpoints]
-        
+            # sprawdź kolor w 4 końcach
+            colors = []
+            for ex, ey in ends:
+                ex = clamp(ex, 0, W - 1)
+                ey = clamp(ey, 0, H - 1)
+                colors.append(img[ey, ex].astype(np.int16))
+
+            frame_rgb = None
+            hits = 0
+            if colors:
+                arr = np.stack(colors, axis=0)
+                ref = np.median(arr, axis=0).astype(np.int16)
+                for c in arr:
+                    if np.max(np.abs(c - ref)) <= TOL_RGB:
+                        hits += 1
+                if hits == 4:
+                    frame_rgb = ref.astype(np.uint8)
+
+            result["laser_endpoints"] = [[int(px), int(py)] for (px, py) in ends]
+
+            # jeśli wszystkie 4 lasery trafiły w zbliżony kolor – robimy prostokąt
+            if frame_rgb is not None:
+                xs_all = [x1, x2] + [int(px) for (px, _) in ends]
+                ys_all = [y1, y2] + [int(py) for (_, py) in ends]
+                bx1, bx2 = int(min(xs_all)), int(max(xs_all))
+                by1, by2 = int(min(ys_all)), int(max(ys_all))
+                result["dropdown_box"] = [bx1, by1, bx2, by2]
+                result["frame_rgb"] = [int(frame_rgb[0]), int(frame_rgb[1]), int(frame_rgb[2])]
+                result["frame_hits"] = hits
+                result["has_frame"] = True
+
         except Exception as e:
             print(f"[ERROR] Processing item {idx+1} failed: {e}")
 
-        results.append(result)
+        return idx, result
+
+
+    max_workers = min(max(1, os.cpu_count() or 2), 8)
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(_process_detection, idx, quad, txt, conf) for idx, (quad, txt, conf) in enumerate(ocr_raw)]
+        for fut in as_completed(futures):
+            i, res = fut.result()
+            results.append((i, res))
+
+    results = [r for _, r in sorted(results, key=lambda x: x[0])]
 
     print(f"[DEBUG] Collected {len(results)} results")
     timer.mark("Process detections")
@@ -1757,50 +2216,71 @@ def run_dropdown_detection(image_path: str) -> dict:
 
     # Uzupełnij tekst opisujący cały box (np. całą odpowiedź) – jeżeli
     # OCR pierwotnie zwrócił pusty string, spróbujemy ponownie na flood-bboxie.
+    t_extra_block_start = time.perf_counter()
     if results:
-        for result in results:
+        # wybierz boxy, dla kt�rych faktycznie op�aca si� robi� extra OCR
+        bboxes_needing_extra: list[tuple[int, list[int]]] = []
+        for idx, result in enumerate(results):
             current_text = (result.get("text") or "").strip()
             bbox_for_text = result.get("dropdown_box") or result.get("text_box")
-            t_extra = time.perf_counter()
-            extra_text = _ocr_text_for_bbox(img, bbox_for_text, pad=6, min_conf=0.15)
-            _stat_add("extra_text", time.perf_counter() - t_extra)
-            if extra_text:
-                result["box_text"] = extra_text
-                if not current_text:
-                    result["text"] = extra_text
+            if not bbox_for_text:
+                continue
+            # je�li ju� mamy do�� d�ugi tekst z sensown� konfidencj�, pomi� extra OCR
+            if current_text and len(current_text) >= 6:
+                continue
+            bboxes_needing_extra.append((idx, bbox_for_text))
 
-    triangles = []
-    if ENABLE_TRIANGLE_DETECT:
-        print("[DEBUG] Detecting triangles...")
-        try:
-            triangles = find_filled_isosceles_triangles_fast(
-                img_rgb=img,
-                lab_img=lab,
-                bg_rgb=tuple(int(x) for x in hist["dominant_rgb"]),
-                bits=TRI_BITS,
-                neighbor_qdist=TRI_NEIGHBOR_QDIST,
-                min_area=TRI_MIN_AREA,
-                min_w=TRI_MIN_W,
-                min_h=TRI_MIN_H,
-                min_geom_area=TRI_MIN_GEOM_AREA,
-                fill_ratio=TRI_FILL_RATIO,
-                iso_tol=TRI_ISO_TOL,
-                bg_delta_e=TRI_BG_DELTA_E
+        if bboxes_needing_extra:
+            box_indices = [i for (i, _) in bboxes_needing_extra]
+            box_list = [b for (_, b) in bboxes_needing_extra]
+
+            t_extra_call = time.perf_counter()
+            extra_texts = _ocr_text_for_bbox_batch(
+                img, box_list, pad=6, min_conf=0.15, downscale_factor=0.5
             )
-            print(f"[DEBUG] Found {len(triangles)} triangles")
-            timer.mark("Triangles detect")
-        except Exception as e:
-            print(f"[ERROR] Triangle detection failed: {e}")
+            dt_extra = time.perf_counter() - t_extra_call
 
+            if extra_texts:
+                per_box = dt_extra / max(1, len(extra_texts))
+                _stat_add("extra_text", per_box)
+
+            for idx, txt_extra in zip(box_indices, extra_texts):
+                if not txt_extra:
+                    continue
+                result = results[idx]
+                current_text = (result.get("text") or "").strip()
+                result["box_text"] = txt_extra
+                if not current_text:
+                    result["text"] = txt_extra
+    timer.add("Extra OCR per box (batch)", time.perf_counter() - t_extra_block_start)
+
+    # Analiza tła per region (layout: np. główna treść vs. pasek boczny)
+    try:
+        bg_layout = _analyze_region_backgrounds(img, text_mask, results, dominant_bg_rgb)
+    except Exception as exc:
+        print(f"[WARN] Background layout analysis failed: {exc}")
+        bg_layout = {"clusters": [], "main_cluster_id": None}
+    timer.mark("Background layout")
+
+    triangles: List[dict] = []
     timer.total("Pipeline TOTAL")
+
+    # Save timings next to the region_grow JSON (data/screen/region_grow/region_grow/<stem>_timings.json)
+    try:
+        img_path = Path(image_path)
+        timings_path = img_path.parent / f"{img_path.stem}_timings.json"
+        timer.dump_json(timings_path)
+    except Exception:
+        pass
 
     return {
         "image": image_path,
         "color_histogram": hist,
         "dominant_bg_over_50": bool(is_plain_bg_global),
+        "background_layout": bg_layout,
         "results": results,
         "triangles": triangles,
-        "ocr_debug": _last_ocr_debug if DEBUG_OCR else None
+        "ocr_debug": _last_ocr_debug if DEBUG_OCR else None,
     }
 
 # ===================== ANOTACJA =================================================
@@ -1817,47 +2297,82 @@ def _build_text_mask_from_results(W: int, H: int, results: Optional[List[dict]])
         m[y1:y2, x1:x2] = True
     
     if TEXT_MASK_DILATE > 0:
-        k = cv2.getStructuringElement(cv2.MORPH_RECT, (1+2*TEXT_MASK_DILATE, 1+2*TEXT_MASK_DILATE))
+        k = _get_rect_kernel((1 + 2 * TEXT_MASK_DILATE, 1 + 2 * TEXT_MASK_DILATE))
         m = cv2.dilate(m.astype(np.uint8), k, iterations=1).astype(bool)
     
     return m
 
 def _ray_stop_on_edge(lab_img: np.ndarray, text_mask: np.ndarray, cx: int, cy: int, dx: int, dy: int,
                      max_len: int = EDGE_MAX_LEN_PX, thr_delta_e: float = EDGE_DELTA_E, consec_req: int = EDGE_CONSEC_N):
-    H, W = lab_img.shape[:2]
-    x, y = cx, cy
-    steps = 0
-    
-    while steps < max_len and 0 <= x < W and 0 <= y < H and text_mask[y, x]:
-        x += dx
-        y += dy
-        steps += 1
-    
-    if not (0 <= x < W and 0 <= y < H):
-        return (clamp(x, 0, W-1), clamp(y, 0, H-1))
-    
-    base = lab_img[y, x].copy()
-    consec = 0
-    last = (x, y)
-    
-    while steps < max_len and 0 <= x < W and 0 <= y < H:
-        if not text_mask[y, x]:
-            dE = deltaE76(lab_img[y, x], base)
-            if dE > thr_delta_e:
-                consec += 1
-                if consec >= consec_req: 
-                    return (x, y)
-            else:
-                consec = 0
-                last = (x, y)
-        x += dx
-        y += dy
-        steps += 1
-    
-    return (clamp(last[0], 0, W-1), clamp(last[1], 0, H-1))
+    """
+    Szybka (wektoryzowana) wersja lasera 1D:
+    - poruszamy się po linii od (cx, cy) w kierunku (dx, dy),
+    - najpierw wychodzimy z obszaru tekstu (text_mask==True),
+    - potem szukamy pierwszego piksela, gdzie deltaE względem koloru startowego
+      przekracza próg (thr_delta_e).
 
-def annotate_and_save(image_path: str, results: List[dict], triangles: Optional[List[dict]] = None,
-                      output_dir: Optional[str] = None) -> str:
+    Uwaga: consec_req > 1 jest ignorowane (i tak zawsze mamy 1), ale API zostaje.
+    """
+    H, W = lab_img.shape[:2]
+    if dx == 0 and dy == 0:
+        return (clamp(cx, 0, W - 1), clamp(cy, 0, H - 1))
+
+    # Wektory kroków wzdłuż promienia
+    steps = np.arange(max_len, dtype=np.int32)
+    xs = cx + dx * steps
+    ys = cy + dy * steps
+
+    # Ogranicz do wnętrza obrazu
+    inside = (xs >= 0) & (xs < W) & (ys >= 0) & (ys < H)
+    if not np.any(inside):
+        return (clamp(cx, 0, W - 1), clamp(cy, 0, H - 1))
+
+    xs = xs[inside]
+    ys = ys[inside]
+
+    # Faza 1: wyjście z obszaru tekstu
+    text_vals = text_mask[ys, xs]
+    non_text_idx = np.where(~text_vals)[0]
+    if non_text_idx.size == 0:
+        # Cały promień w tekście – zwróć ostatni ważny punkt
+        return (clamp(int(xs[-1]), 0, W - 1), clamp(int(ys[-1]), 0, H - 1))
+
+    start_idx = int(non_text_idx[0])
+    base_x = int(xs[start_idx])
+    base_y = int(ys[start_idx])
+    base = lab_img[base_y, base_x].astype(np.int16, copy=False)
+
+    # Faza 2: szukamy przejścia koloru powyżej progu dE
+    xs_tail = xs[start_idx:]
+    ys_tail = ys[start_idx:]
+    if xs_tail.size == 0:
+        return (clamp(base_x, 0, W - 1), clamp(base_y, 0, H - 1))
+
+    # Ekstrahuj próbki LAB na ogonie promienia
+    samples = lab_img[ys_tail, xs_tail].astype(np.int16, copy=False)
+    diff = samples - base.reshape(1, 3)
+    # Używamy kwadratu odległości zamiast sqrt dla szybkości
+    dist2 = np.sum(diff * diff, axis=1)
+    thr2 = float(thr_delta_e * thr_delta_e)
+
+    hit_idx_rel_candidates = np.where(dist2 > thr2)[0]
+    if hit_idx_rel_candidates.size == 0:
+        # Nie znaleziono ostrej krawędzi – bierzemy ostatni punkt na promieniu
+        end_x = int(xs_tail[-1])
+        end_y = int(ys_tail[-1])
+    else:
+        hit_idx_rel = int(hit_idx_rel_candidates[0])
+        end_x = int(xs_tail[hit_idx_rel])
+        end_y = int(ys_tail[hit_idx_rel])
+
+    return (clamp(end_x, 0, W - 1), clamp(end_y, 0, H - 1))
+
+def annotate_and_save(
+    image_path: str,
+    results: List[dict],
+    triangles: Optional[List[dict]] = None,
+    output_dir: Optional[str] = None,
+) -> str:
     print(f"[DEBUG ANNOT] Starting annotation for {len(results)} results")
     im = Image.open(image_path).convert("RGBA")
     W, H = im.size
@@ -1871,16 +2386,61 @@ def annotate_and_save(image_path: str, results: List[dict], triangles: Optional[
     od = ImageDraw.Draw(overlay)
 
     # Regiony z obramowaniem
-    frame_count = 0
+    # Najpierw zbierz wszystkie ramki, potem policz zagnieżdżenie,
+    # żeby nadać różne odcienie czerwieni (do 5 poziomów).
+    frame_boxes: List[Tuple[int, int, int, int]] = []
     for r in results:
         if r.get("has_frame") and r.get("dropdown_box"):
             bx1, by1, bx2, by2 = r["dropdown_box"]
-            bx1 = clamp(bx1, 0, W-1)
-            by1 = clamp(by1, 0, H-1)
+            bx1 = clamp(bx1, 0, W - 1)
+            by1 = clamp(by1, 0, H - 1)
             bx2 = clamp(bx2, 1, W)
             by2 = clamp(by2, 1, H)
-            od.rectangle((bx1, by1, bx2, by2), fill=REGION_FILL_RGBA, outline=REGION_EDGE_RGBA, width=3)
-            frame_count += 1
+            frame_boxes.append((bx1, by1, bx2, by2))
+
+    def _contains(outer: Tuple[int, int, int, int], inner: Tuple[int, int, int, int], margin: int = 1) -> bool:
+        ox1, oy1, ox2, oy2 = outer
+        ix1, iy1, ix2, iy2 = inner
+        # outer musi być realnie większy od inner (żeby nie liczyć tego samego poziomu)
+        if (ox2 - ox1) <= (ix2 - ix1) or (oy2 - oy1) <= (iy2 - iy1):
+            return False
+        return (ox1 <= ix1 + margin and oy1 <= iy1 + margin and
+                ox2 >= ix2 - margin and oy2 >= iy2 - margin)
+
+    max_levels = 5
+    depths: List[int] = []
+    for i, inner in enumerate(frame_boxes):
+        depth = 0
+        for j, outer in enumerate(frame_boxes):
+            if i == j:
+                continue
+            if _contains(outer, inner):
+                depth += 1
+        # 0 = brak zagnieżdżenia, 1 = w jednym boxie, ...
+        # ucinamy na max_levels-1 (np. 4 dla 5 poziomów).
+        depths.append(min(depth, max_levels - 1))
+
+    # Przygotuj 5 odcieni czerwieni: im głębiej, tym jaśniej.
+    # Kolor powstaje jako miks bazowego REGION_EDGE_RGBA z bielą.
+    base_r, base_g, base_b, _ = REGION_EDGE_RGBA
+
+    def _shade_for_level(level: int) -> Tuple[Tuple[int, int, int, int], Tuple[int, int, int, int]]:
+        # poziomy 0..4 -> rosnąca jasność
+        factors = [0.0, 0.25, 0.5, 0.7, 0.85]
+        f = factors[max(0, min(level, len(factors) - 1))]
+        r = int(base_r * (1.0 - f) + 255 * f)
+        g = int(base_g * (1.0 - f) + 255 * f)
+        b = int(base_b * (1.0 - f) + 255 * f)
+        # zachowujemy różne alpha dla wypełnienia i krawędzi
+        fill = (r, g, b, REGION_FILL_RGBA[3])
+        edge = (r, g, b, REGION_EDGE_RGBA[3])
+        return fill, edge
+
+    frame_count = 0
+    for (bx1, by1, bx2, by2), depth in zip(frame_boxes, depths):
+        fill_rgba, edge_rgba = _shade_for_level(depth)
+        od.rectangle((bx1, by1, bx2, by2), fill=fill_rgba, outline=edge_rgba, width=3)
+        frame_count += 1
     print(f"[DEBUG ANNOT] Drew {frame_count} frame regions")
 
     # Wszystkie OCR boxy
@@ -1915,25 +2475,42 @@ def annotate_and_save(image_path: str, results: List[dict], triangles: Optional[
         laser_count += 1
     print(f"[DEBUG ANNOT] Drew {laser_count} laser sets")
 
-    # Trójkąty
-    tri_count = 0
-    if triangles:
-        for tri in triangles:
-            hull = tri["hull"]
-            od.polygon(hull, fill=TRI_FILL_RGBA, outline=TRI_EDGE_RGBA)
-            od.line(hull + [hull[0]], fill=TRI_EDGE_RGBA, width=TRI_EDGE_WIDTH)
-            tri_count += 1
-    print(f"[DEBUG ANNOT] Drew {tri_count} triangles")
+    # Trójkąty (wyłączone)
+    print("[DEBUG ANNOT] Triangles skipped (feature removed)")
 
     print("[DEBUG ANNOT] Compositing layers...")
     merged = Image.alpha_composite(im, base)
     out = Image.alpha_composite(merged, overlay).convert("RGB")
     
-    target_dir = output_dir or os.path.dirname(image_path)
+    target_dir = output_dir or str(REGION_GROW_ANNOT_DIR)
     os.makedirs(target_dir, exist_ok=True)
     base_name = os.path.splitext(os.path.basename(image_path))[0]
     out_path = os.path.join(target_dir, f"{base_name}_annot.png")
     out.save(out_path)
+    # Dodatkowy zapis do pliku potrzebnego w pipeline UI
+    try:
+        current_dir = REGION_GROW_ANNOT_CURRENT_DIR
+        current_dir.mkdir(parents=True, exist_ok=True)
+        current_path = current_dir / "region_grow_annot_current.png"
+        out.save(current_path)
+        # Archiwalna kopia (zawsze nowy plik) w region_grow_annot
+        hist_ts = int(time.time() * 1000)
+        hist_name = f"{base_name}_annot_{hist_ts}.png"
+        hist_path = REGION_GROW_ANNOT_DIR / hist_name
+        try:
+            REGION_GROW_ANNOT_DIR.mkdir(parents=True, exist_ok=True)
+            out.save(hist_path)
+            print(f"[DEBUG ANNOT] Saved history copy: {hist_path}")
+        except Exception as e_hist:
+            print(f"[WARN] Failed to save history annotation: {e_hist}")
+        print(f"[DEBUG ANNOT] Saved current: {current_path}")
+    except Exception as e:
+        print(f"[WARN] Failed to save current annotation: {e}")
+    # Dodatkowa wizualizacja klastrów tła (regions/regions_current)
+    try:
+        annotate_regions_and_save(image_path, results)
+    except Exception as e_reg:
+        print(f"[WARN REGIONS] annotate_regions_and_save failed: {e_reg}")
     print(f"[DEBUG ANNOT] Saved: {out_path}")
     return out_path
 
@@ -1947,7 +2524,7 @@ def main():
     import sys
     
     try:
-        path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_IMAGE_PATH
+        path = sys.argv[1] if len(sys.argv) > 1 else _resolve_default_image()
         print(f"[DEBUG] Image path: {path}")
         
         if not os.path.isfile(path):
@@ -1955,7 +2532,7 @@ def main():
             return
         
         out = run_dropdown_detection(path)
-        out_path = annotate_and_save(path, out.get("results", []), out.get("triangles"), output_dir=JSON_OUT_DIR)
+        out_path = annotate_and_save(path, out.get("results", []), out.get("triangles"), output_dir=str(REGION_GROW_ANNOT_DIR))
         
         # ========== ZAPIS JSON DO PLIKU (NOWA ŚCIEŻKA) ==========
         os.makedirs(JSON_OUT_DIR, exist_ok=True)
@@ -2251,21 +2828,19 @@ def main_cli():
     try:
 
         if arg is None:
-            images = _iter_images_in_dir(_Path(RAW_SCREEN_DIR))
-            if images:
-                print(
-                    f"[DEBUG] No CLI path -> processing folder: {RAW_SCREEN_DIR} "
-                    f"({len(images)} images)"
-                )
+            default_img = _Path(_resolve_default_image())
+            if default_img.exists():
+                images = [default_img]
+                print(f"[DEBUG] No CLI path -> using default image: {default_img}")
             else:
-                print(f"[WARN] No images found in folder: {RAW_SCREEN_DIR}")
-                if os.path.isfile(DEFAULT_IMAGE_PATH):
-                    images = [_Path(DEFAULT_IMAGE_PATH)]
+                images = _iter_images_in_dir(_Path(RAW_SCREEN_DIR))
+                if images:
                     print(
-                        f"[DEBUG] Falling back to single default image: {DEFAULT_IMAGE_PATH}"
+                        f"[DEBUG] No CLI path -> processing folder: {RAW_SCREEN_DIR} "
+                        f"({len(images)} images)"
                     )
                 else:
-                    print(f"[ERROR] Default image not found: {DEFAULT_IMAGE_PATH}")
+                    print(f"[ERROR] No images available (checked {RAW_SCREEN_DIR})")
                     print("\n[DEBUG] CLI END")
                     return
         else:
@@ -2290,12 +2865,20 @@ def main_cli():
                 print(f"[WARN] File not found, skipping: {path_str}")
                 continue
 
+            try:
+                CURRENT_RUN_DIR.mkdir(parents=True, exist_ok=True)
+                current_target = CURRENT_RUN_DIR / "screenshot.png"
+                shutil.copy2(path_str, current_target)
+                print(f"[DEBUG] Current run screenshot updated: {current_target}")
+            except Exception as exc:
+                print(f"[WARN] Could not update CURRENT_RUN_DIR screenshot: {exc}")
+
             print("\n" + "=" * 60)
             print(f"[DEBUG] Image path: {path_str}")
 
             out = run_dropdown_detection(path_str)
             t_annot = time.perf_counter()
-            out_path = annotate_and_save(path_str, out.get("results", []), out.get("triangles"), output_dir=JSON_OUT_DIR)
+            out_path = annotate_and_save(path_str, out.get("results", []), out.get("triangles"), output_dir=str(REGION_GROW_ANNOT_DIR))
             print(f"[TIMER] Annotate + save overlay: {(time.perf_counter()-t_annot)*1000:.1f} ms")
 
             base_name = os.path.splitext(os.path.basename(path_str))[0]

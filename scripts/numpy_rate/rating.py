@@ -13,6 +13,7 @@ import re
 import unicodedata
 from typing import List, Dict, Tuple, Optional
 from pathlib import Path
+import shutil
 
 # Optional OCR deps
 try:
@@ -27,7 +28,7 @@ except Exception:
 OCR_LANG = os.environ.get("OCR_LANG", "pol+eng")
 
 # ======================== DEBUG MODE ============================
-DEBUG_MODE = True  # Ustaw False żeby wyłączyć wypisywanie na konsolę
+DEBUG_MODE = False  # Domyślnie bez hałaśliwego outputu (Windows console encoding fix)
 DEBUG_RESULTS = []  # Konsolowe zestawienie top wyników dropdown (legacy)
 # Szczegółowe debug per element (zapisywane do pliku obok wyników)
 ELEMENT_DEBUG: Dict[str, Dict[str, dict]] = {}
@@ -35,10 +36,16 @@ ELEMENT_DEBUG: Dict[str, Dict[str, dict]] = {}
 # ======================== ĹšCIEĹ»KI I/O ===========================
 ROOT = Path(__file__).resolve().parents[2]
 DATA_SCREEN_DIR = ROOT / "data" / "screen"
-INPUT_DIR = str(DATA_SCREEN_DIR / "numpy_points" / "screen_boxes")
-RATE_RESULTS_DIR = str(DATA_SCREEN_DIR / "numpy_points" / "rate_results")
-RATE_RESULTS_DEBUG_DIR = str(DATA_SCREEN_DIR / "numpy_points" / "rate_results_debug")
-RATE_SUMMARY_DIR = str(DATA_SCREEN_DIR / "numpy_points" / "rate_summary")
+REGION_GROW_DIR = DATA_SCREEN_DIR / "region_grow" / "region_grow"
+INPUT_DIR = str(REGION_GROW_DIR)
+RATE_RESULTS_DIR = str(DATA_SCREEN_DIR / "rate" / "rate_results")
+RATE_RESULTS_DEBUG_DIR = str(DATA_SCREEN_DIR / "rate" / "rate_results_debug")
+RATE_SUMMARY_DIR = str(DATA_SCREEN_DIR / "rate" / "rate_summary")
+RATE_RESULTS_CURRENT_DIR = str(DATA_SCREEN_DIR / "rate" / "rate_results_current")
+RATE_RESULTS_DEBUG_CURRENT_DIR = str(DATA_SCREEN_DIR / "rate" / "rate_results_debug_current")
+RATE_SUMMARY_CURRENT_DIR = str(DATA_SCREEN_DIR / "rate" / "rate_summary_current")
+DOM_LIVE_DIR = ROOT / "dom_live"
+CURRENT_QUESTION_PATH = DOM_LIVE_DIR / "current_question.json"
 
 # ======================== PROGI DECYZYJNE =======================
 THRESHOLDS = {
@@ -260,6 +267,63 @@ def triangle_bbox_from_record(record) -> Optional[List[float]]:
         return [min(xs), min(ys), max(xs), max(ys)]
     return None
 
+
+def _mirror_to_current(src_path: str, current_dir: str) -> None:
+    """
+    Skopiuj plik do katalogu *_current, trzymając tam zawsze tylko jeden plik.
+    Jeżeli coś pójdzie nie tak, po prostu pomiń (bez przerywania ratingu).
+    """
+    try:
+        if not src_path or not os.path.isfile(src_path):
+            return
+        ensure_dir(current_dir)
+        # Usuń stare pliki w katalogu *_current
+        for name in os.listdir(current_dir):
+            full = os.path.join(current_dir, name)
+            if os.path.isfile(full):
+                try:
+                    os.remove(full)
+                except Exception:
+                    pass
+        dst = os.path.join(current_dir, os.path.basename(src_path))
+        shutil.copy2(src_path, dst)
+    except Exception:
+        # Brak loga tutaj, żeby nie hałasować w konsoli przy drobnych problemach
+        pass
+
+
+def _load_scrollable_regions_from_dom() -> List[List[int]]:
+    """
+    Odczytuje z current_question.json listę prostokątów DOM, które są
+    oznaczone jako scrollowalne (scrollable==True). Używane do annotacji
+    elementów w summary (np. dropdownów) polem 'scrollable'.
+    """
+    try:
+        if not CURRENT_QUESTION_PATH.exists():
+            return []
+        data = json.loads(CURRENT_QUESTION_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    rects: List[List[int]] = []
+    elems = data.get("question_elements") or data.get("text_elements") or []
+    for el in elems:
+        if not isinstance(el, dict):
+            continue
+        if not (el.get("scrollable") or el.get("scrollableY") or el.get("scrollableX")):
+            continue
+        bbox = el.get("bbox") or {}
+        try:
+            x = int(bbox.get("x", 0))
+            y = int(bbox.get("y", 0))
+            w = int(bbox.get("width", 0))
+            h = int(bbox.get("height", 0))
+        except Exception:
+            continue
+        if w <= 4 or h <= 4:
+            continue
+        rects.append([x, y, x + w, y + h])
+    return rects
+
 def triangle_centroid_from_record(record) -> Optional[Tuple[float, float]]:
     if record is None:
         return None
@@ -329,6 +393,27 @@ NEXT_KEYWORDS_PL = [
 NEXT_KEYWORDS_EN = [
     r"\bnext\b", r"\bcontinue\b", r"\bproceed\b", r"\bforward\b"
 ]
+NEXT_RE = re.compile("|".join(NEXT_KEYWORDS_PL + NEXT_KEYWORDS_EN), re.IGNORECASE)
+
+# Dodatkowe frazy „ankietowe” dla przycisków następnego kroku.
+NEXT_EXTRA_PL = [
+    r"\bnast[eę]pne\s+pytanie\b",
+    r"\bnast[eę]pna\s+strona\b",
+    r"\bprzejd[źz]\s+dalej\b",
+    r"\bprzejd[źz]\s+do\s+(nast[eę]pnego|kolejnego)\b",
+    r"\bzako[nń]cz\b",
+    r"\bzako[nń]cz\s+ankiet[ęey]\b",
+    r"\bwy[sś]lij\b",
+    r"\bwy[sś]lij\s+odpowiedzi\b",
+]
+NEXT_EXTRA_EN = [
+    r"\bfinish\b",
+    r"\bsubmit\b",
+    r"\bdone\b",
+    r"\bnext\s+question\b",
+]
+NEXT_KEYWORDS_PL = NEXT_KEYWORDS_PL + NEXT_EXTRA_PL
+NEXT_KEYWORDS_EN = NEXT_KEYWORDS_EN + NEXT_EXTRA_EN
 NEXT_RE = re.compile("|".join(NEXT_KEYWORDS_PL + NEXT_KEYWORDS_EN), re.IGNORECASE)
 
 DROPDOWN_STRONG_PL = [
@@ -586,13 +671,33 @@ def score_next(elem: dict, elements: List[dict], buttons: List[dict],
 
     scores: List[float] = []
 
-    # S?owa kluczowe
+    # Słowa kluczowe
     text_normalized = lower_strip_acc(text)
     if NEXT_RE.search(text_normalized):
         has_pl = any(re.search(p, text_normalized) for p in NEXT_KEYWORDS_PL)
         has_en = any(re.search(p, text_normalized) for p in NEXT_KEYWORDS_EN)
         if has_pl or has_en:
             scores.append(0.35)
+
+    # Proste, krótkie napisy typu „Dalej”, „Next”, „Kontynuuj”
+    norm_simple = (text or "").strip().lower()
+    SIMPLE_NEXT_WORDS = {
+        "dalej",
+        "next",
+        "continue",
+        "kontynuuj",
+        "zakończ",
+        "zakończ ankietę",
+        "finish",
+        "submit",
+        "done",
+    }
+    if norm_simple in SIMPLE_NEXT_WORDS:
+        scores.append(0.15)
+
+    # Delikatny bonus, jeśli w tekście pada „ankiet...” (kontekst ankiety)
+    if "ankiet" in text_normalized:
+        scores.append(0.05)
 
     # Symbole strza?ek
     if has_arrow_symbols(text) > 0:
@@ -1240,6 +1345,7 @@ def evaluate(data: dict) -> dict:
     # Wczytaj elementy
     elements = []
     image = data.get("image")
+    background_layout = data.get("background_layout") or {}
     
     # Pobierz wymiary obrazu (jeĹ›li sÄ…)
     image_width = 1920  # default
@@ -1339,6 +1445,15 @@ def evaluate(data: dict) -> dict:
             "has_dropdown_box": bool(c.get("dropdown_box") is not None) if isinstance(c, dict) else False,
             "has_frame": bool(c.get("has_frame", False)) if isinstance(c, dict) else False,
             "frame_hits": int(c.get("frame_hits", 0)) if isinstance(c, dict) else 0,
+            # Przekazanie informacji o tle z region_grow (jeśli istnieje)
+            "bg_cluster_id": (int(c.get("bg_cluster_id")) if isinstance(c, dict) and c.get("bg_cluster_id") is not None else None),
+            "bg_is_main_like": bool(c.get("bg_is_main_like")) if isinstance(c, dict) and ("bg_is_main_like" in c) else None,
+            "bg_mean_rgb": (c.get("bg_mean_rgb") if isinstance(c, dict) else None),
+            "bg_dist_to_global": (
+                float(c.get("bg_dist_to_global", 0.0))
+                if isinstance(c, dict) and ("bg_dist_to_global" in c)
+                else None
+            ),
         })
     buttons = data.get("buttons", []) or []
     
@@ -1454,6 +1569,7 @@ def evaluate(data: dict) -> dict:
         "total_elements": len(results),
         "elements": results,
         "thresholds": THRESHOLDS,
+        "background_layout": background_layout,
         "summary": {
             "next_detected": sum(1 for r in results if r["predictions"]["next_active"] or r["predictions"]["next_inactive"]),
             "dropdown_detected": sum(1 for r in results if r["predictions"]["dropdown"]),
@@ -1616,8 +1732,11 @@ def build_summary_payload(result: dict) -> dict:
     summary = {
         "image": result.get("image"),
         "total_elements": result.get("total_elements"),
+        "background_layout": result.get("background_layout"),
         "top_labels": {},
     }
+
+    scroll_rects = _load_scrollable_regions_from_dom()
 
     def _pick_best(label: str) -> Optional[dict]:
         best = None
@@ -1636,6 +1755,38 @@ def build_summary_payload(result: dict) -> dict:
                         "score": round(sc, 4),
                         "label": label,
                     }
+                    # Przekaż dalej meta-dane o tle (jeśli są dostępne)
+                    if "bg_cluster_id" in el:
+                        try:
+                            cid = el.get("bg_cluster_id")
+                            best["bg_cluster_id"] = int(cid) if cid is not None else None
+                        except Exception:
+                            best["bg_cluster_id"] = None
+                    if "bg_is_main_like" in el:
+                        try:
+                            best["bg_is_main_like"] = bool(el.get("bg_is_main_like"))
+                        except Exception:
+                            best["bg_is_main_like"] = None
+                    if "bg_mean_rgb" in el and isinstance(el.get("bg_mean_rgb"), (list, tuple)):
+                        best["bg_mean_rgb"] = list(el.get("bg_mean_rgb"))
+                    if "bg_dist_to_global" in el:
+                        try:
+                            best["bg_dist_to_global"] = float(el.get("bg_dist_to_global"))
+                        except Exception:
+                            best["bg_dist_to_global"] = None
+                    # Annotacja scrollowalności na podstawie DOM
+                    if scroll_rects:
+                        bbox = el.get("bbox")
+                        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                            try:
+                                b = [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])]
+                                cx, cy = bbox_center(b)
+                                for r in scroll_rects:
+                                    if point_in_bbox((cx, cy), r, margin=3.0) or rect_iou(b, r) > 0.15:
+                                        best["scrollable"] = True
+                                        break
+                            except Exception:
+                                pass
         return best
 
     for lbl in ("dropdown", "next_active", "next_inactive", "answer_single", "answer_multi", "cookie_accept", "cookie_reject"):

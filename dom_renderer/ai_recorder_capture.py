@@ -316,6 +316,15 @@ class LiveRecorderCaptureMixin:
                             const rect = el.getBoundingClientRect();
                             const tag = el.tagName.toLowerCase();
                             const className = (el.className || '').toString();
+                            const style = getComputedStyle(el);
+                            const sh = el.scrollHeight || 0;
+                            const ch = el.clientHeight || 0;
+                            const sw = el.scrollWidth || 0;
+                            const cw = el.clientWidth || 0;
+                            const overflowY = (style.overflowY || '').toLowerCase();
+                            const overflowX = (style.overflowX || '').toLowerCase();
+                            const scrollableY = (sh - ch) > 8 && (overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay' || overflowY === '');
+                            const scrollableX = (sw - cw) > 8 && (overflowX === 'auto' || overflowX === 'scroll' || overflowX === 'overlay');
                             
                             elements.push({
                                 text: text.substring(0, 500),
@@ -333,7 +342,10 @@ class LiveRecorderCaptureMixin:
                                     right: Math.round(rect.right),
                                     bottom: Math.round(rect.bottom)
                                 },
-                                isQuestion: className.includes('question') || className.includes('prompt')
+                                isQuestion: className.includes('question') || className.includes('prompt'),
+                                scrollable: scrollableY || scrollableX,
+                                scrollableY: scrollableY,
+                                scrollableX: scrollableX
                             });
                         }
                     }
@@ -368,6 +380,15 @@ class LiveRecorderCaptureMixin:
                             const rect = el.getBoundingClientRect();
                             const tag = el.tagName.toLowerCase();
                             const className = (el.className || '').toString();
+                            const style = getComputedStyle(el);
+                            const sh = el.scrollHeight || 0;
+                            const ch = el.clientHeight || 0;
+                            const sw = el.scrollWidth || 0;
+                            const cw = el.clientWidth || 0;
+                            const overflowY = (style.overflowY || '').toLowerCase();
+                            const overflowX = (style.overflowX || '').toLowerCase();
+                            const scrollableY = (sh - ch) > 8 && (overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay' || overflowY === '');
+                            const scrollableX = (sw - cw) > 8 && (overflowX === 'auto' || overflowX === 'scroll' || overflowX === 'overlay');
                             
                             elements.push({
                                 text: text.substring(0, 500),
@@ -386,6 +407,9 @@ class LiveRecorderCaptureMixin:
                                     bottom: Math.round(rect.bottom)
                                 },
                                 isQuestion: className.includes('question') || className.includes('prompt'),
+                                scrollable: scrollableY || scrollableX,
+                                scrollableY: scrollableY,
+                                scrollableX: scrollableX,
                                 inModal: true
                             });
                         }
@@ -962,7 +986,17 @@ class LiveRecorderCaptureMixin:
                 with contextlib.suppress(Exception):
                     self._write_tabs_file()
                 return
-            await loop.run_in_executor(None, lambda: self.file_page.write_text(payload, encoding="utf-8"))
+            def _write_page_files() -> None:
+                try:
+                    self.file_page.write_text(payload, encoding="utf-8")
+                except Exception:
+                    pass
+                try:
+                    self.file_page_static.write_text(payload, encoding="utf-8")
+                except Exception:
+                    pass
+
+            await loop.run_in_executor(None, _write_page_files)
             self._last_page_md5 = ph
             with contextlib.suppress(Exception):
                 self._write_tabs_file()
