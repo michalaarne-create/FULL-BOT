@@ -237,7 +237,7 @@ def _draw_points_overlay(
         draw.line(points, fill=lc, width=max(1, int(line_width)))
     r = max(1, int(radius))
     for x, y in points:
-        draw.ellipse((x - r, y - r, x + r, y + r), fill=colour, outline=colour)
+        draw.ellipse((x - r, y - r, x + r, y + r), fill=None, outline=colour)
 
     if out_hist:
         out_hist = out_hist.with_suffix(".png")
@@ -271,7 +271,7 @@ def _overlay_on_speed(
     hist_out = HOVER_POINTS_SPEED_DIR / f"{stem}_hover_points_on_speed" if hist else None
     current_out = HOVER_POINTS_SPEED_CURRENT_DIR / "hover_points_on_speed"
 
-    # Zapisz current z current tła, a historię z historycznego tła (żeby kolory heatmapy były 1:1).
+    # Zapisz current z current tĹ‚a, a historiÄ™ z historycznego tĹ‚a (ĹĽeby kolory heatmapy byĹ‚y 1:1).
     if heatmap_current_path is not None:
         _draw_points_overlay(
             heatmap_current_path,
@@ -282,11 +282,11 @@ def _overlay_on_speed(
             radius=3,
             draw_lines=True,
             paths=paths,
-            line_colour=(255, 200, 0), # linia zółto-pomarańczowa
+            line_colour=(255, 200, 0), # linia zĂłĹ‚to-pomaraĹ„czowa
             line_width=3,
         )
     elif heatmap_hist_path is not None:
-        # Fallback: brak current tła -> użyj hist do current.
+        # Fallback: brak current tĹ‚a -> uĹĽyj hist do current.
         _draw_points_overlay(
             heatmap_hist_path,
             points,
@@ -329,7 +329,7 @@ def _overlay_on_path(
     hist_out = HOVER_POINTS_PATH_DIR / f"{stem}_hover_points_on_path" if hist else None
     current_out = HOVER_POINTS_PATH_CURRENT_DIR / "hover_points_on_path"
 
-    # Current zawsze na aktualnym hover_path.png, żeby było 1:1
+    # Current zawsze na aktualnym hover_path.png, ĹĽeby byĹ‚o 1:1
     if bg_current.exists():
         _draw_points_overlay(
             bg_current,
@@ -373,7 +373,7 @@ def _overlay_on_path(
 
 
 def _load_hover_output_paths() -> List[List[Tuple[int, int]]]:
-    """Wczytaj ścieżki (lista punktów na element) z hover_output_current/hover_output.json (pole dots)."""
+    """Wczytaj Ĺ›cieĹĽki (lista punktĂłw na element) z hover_output_current/hover_output.json (pole dots)."""
     json_path = HOVER_OUTPUT_CURRENT_DIR / "hover_output.json"
     if not json_path.exists():
         return []
@@ -476,7 +476,7 @@ def main() -> None:
             samples.append(Sample(t=t, x=int(x), y=int(y)))
 
             if autosave > 0 and (now - last_save) >= autosave and len(samples) >= 2:
-                # Jeśli hover_output_current pojawi się później, doładuj raz.
+                # JeĹ›li hover_output_current pojawi siÄ™ pĂłĹşniej, doĹ‚aduj raz.
                 if not reference_paths:
                     reference_paths = _load_hover_output_paths()
                 segs_live = build_speed_segments(samples)
