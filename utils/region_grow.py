@@ -2656,11 +2656,8 @@ def annotate_and_save(
         print(f"[DEBUG ANNOT] Saved current: {current_path}")
     except Exception as e:
         print(f"[WARN] Failed to save current annotation: {e}")
-    # Dodatkowa wizualizacja klastrów tła (regions/regions_current)
-    try:
-        annotate_regions_and_save(image_path, results)
-    except Exception as e_reg:
-        print(f"[WARN REGIONS] annotate_regions_and_save failed: {e_reg}")
+    # Dodatkowa wizualizacja regionów tła (regions_current.*) – GPU-only, błąd ma przerwać.
+    annotate_regions_and_save(image_path, results)
     print(f"[DEBUG ANNOT] Saved: {out_path}")
     return out_path
 
