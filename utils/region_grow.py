@@ -1500,6 +1500,192 @@ def pick_seed(img_rgb: np.ndarray, text_box_xyxy: Tuple[int, int, int, int], pad
     return cy, cx, img_rgb[cy, cx]
 
 
+def annotate_regions_floodfill_and_save_from_mask(image_path: str, img_rgb: np.ndarray, text_mask: np.ndarray) -> None:
+    """
+    Flood-fill regionów tła (bez boxów) z ignorowaniem maski tekstu.
+
+    Zapisuje obok siebie:
+    - `REGION_REGIONS_CURRENT_DIR/regions_current.png`
+    - `REGION_REGIONS_CURRENT_DIR/regions_current.json`
+
+    Regiony/boxy < `RG_MIN_REGION_AREA` są odrzucane.
+    Brak GPU / błąd GPU => wyjątek (bez CPU fallback).
+    """
+    if not GPU_FLOOD_AVAILABLE:
+        raise RuntimeError("GPU floodfill required for regions overlay, but CuPy/cupyx.scipy.ndimage is unavailable.")
+
+    img_np = np.ascontiguousarray(np.asarray(img_rgb, dtype=np.uint8))
+    H, W = img_np.shape[:2]
+
+    tm = np.asarray(text_mask)
+    if tm.ndim == 3:
+        tm = (tm != 0).any(axis=2)
+    tm = (tm != 0).astype(bool)
+
+    base_name = os.path.splitext(os.path.basename(image_path))[0]
+
+    from collections import deque
+
+    step = max(2, int(RG_REGIONS_STEP))
+    tol = int(max(2, RG_REGIONS_TOL_RGB))
+
+    img_s = img_np[0::step, 0::step]
+    tm_s = tm[0::step, 0::step]
+    hs, ws = img_s.shape[:2]
+    visited = np.zeros((hs, ws), dtype=bool)
+
+    neigh = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+
+    def _find_seed_ref(sy: int, sx: int):
+        if not tm_s[sy, sx]:
+            return sy, sx
+        max_r = 6
+        for r in range(1, max_r + 1):
+            for dy, dx in neigh:
+                ny, nx = sy + dy * r, sx + dx * r
+                if 0 <= ny < hs and 0 <= nx < ws and not tm_s[ny, nx]:
+                    return ny, nx
+        return None
+
+    coarse: list[dict] = []
+    for sy in range(hs):
+        for sx in range(ws):
+            if visited[sy, sx]:
+                continue
+            visited[sy, sx] = True
+            ref_pos = _find_seed_ref(sy, sx)
+            if ref_pos is None:
+                continue
+            ry, rx = ref_pos
+            ref = img_s[ry, rx].astype(np.int16)
+
+            q = deque([(sy, sx)])
+            miny = maxy = sy
+            minx = maxx = sx
+
+            while q:
+                y, x = q.popleft()
+                miny = min(miny, y)
+                maxy = max(maxy, y)
+                minx = min(minx, x)
+                maxx = max(maxx, x)
+                for dy, dx in neigh:
+                    ny, nx = y + dy, x + dx
+                    if not (0 <= ny < hs and 0 <= nx < ws):
+                        continue
+                    if visited[ny, nx]:
+                        continue
+                    visited[ny, nx] = True
+                    if tm_s[ny, nx]:
+                        q.append((ny, nx))
+                        continue
+                    col = img_s[ny, nx].astype(np.int16)
+                    if int(np.max(np.abs(col - ref))) <= tol:
+                        q.append((ny, nx))
+
+            x1 = int(minx * step)
+            y1 = int(miny * step)
+            x2 = int(min((maxx + 1) * step, W))
+            y2 = int(min((maxy + 1) * step, H))
+            area = int(max(0, x2 - x1) * max(0, y2 - y1))
+            if area < int(RG_MIN_REGION_AREA):
+                continue
+            coarse.append(
+                {"seed_y": int(ry * step), "seed_x": int(rx * step), "bbox": (x1, y1, x2, y2), "area": area}
+            )
+
+    if not coarse:
+        # Nadal zapisujemy pusty JSON (żeby brain widział brak regionów)
+        REGION_REGIONS_CURRENT_DIR.mkdir(parents=True, exist_ok=True)
+        empty_path = REGION_REGIONS_CURRENT_DIR / "regions_current.json"
+        with empty_path.open("w", encoding="utf-8") as f:
+            json.dump({"image": str(image_path), "params": {"step": step, "tol_rgb": tol}, "regions": []}, f, ensure_ascii=False, indent=2)
+        return
+
+    coarse.sort(key=lambda r: r.get("area", 0), reverse=True)
+    coarse = coarse[: max(1, int(RG_REGIONS_MAX))]
+
+    region_masks: list[np.ndarray] = []
+    regions_out: list[dict] = []
+    for r in coarse:
+        x1, y1, x2, y2 = r["bbox"]
+        w = max(1, x2 - x1)
+        h = max(1, y2 - y1)
+        seed_y = clamp(int(r["seed_y"]), 0, H - 1)
+        seed_x = clamp(int(r["seed_x"]), 0, W - 1)
+        radius = int(min(MAX_RADIUS, max(120, 0.65 * max(w, h) + 80)))
+
+        mask_bbox = flood_region_gpu_masked(img_np, tm, seed_y, seed_x, tol_rgb=tol, radius=radius, neighbor8=True)
+        if mask_bbox is None:
+            continue
+        m_full, bbox_xyxy = mask_bbox
+        if m_full is None or bbox_xyxy is None:
+            continue
+
+        bx1, by1, bx2, by2 = [int(v) for v in bbox_xyxy]
+        refined_area = int(max(0, bx2 - bx1) * max(0, by2 - by1))
+        if refined_area < int(RG_MIN_REGION_AREA):
+            continue
+
+        region_masks.append(m_full.astype(bool))
+        regions_out.append(
+            {
+                "seed_xy": [int(seed_x), int(seed_y)],
+                "coarse_bbox_xyxy": [int(x1), int(y1), int(x2), int(y2)],
+                "refined_bbox_xyxy": [int(bx1), int(by1), int(bx2), int(by2)],
+                "area": refined_area,
+                "radius": int(radius),
+            }
+        )
+
+    if not region_masks:
+        REGION_REGIONS_CURRENT_DIR.mkdir(parents=True, exist_ok=True)
+        empty_path = REGION_REGIONS_CURRENT_DIR / "regions_current.json"
+        with empty_path.open("w", encoding="utf-8") as f:
+            json.dump({"image": str(image_path), "params": {"step": step, "tol_rgb": tol}, "regions": []}, f, ensure_ascii=False, indent=2)
+        return
+
+    out = img_np.copy()
+    alpha = 0.22
+    palette = [
+        (0, 140, 255),
+        (255, 0, 180),
+        (0, 200, 0),
+        (255, 165, 0),
+        (180, 0, 255),
+        (255, 0, 0),
+        (0, 255, 200),
+        (255, 255, 0),
+    ]
+
+    used = np.zeros((H, W), dtype=bool)
+    for idx, m in enumerate(region_masks):
+        m = m.astype(bool) & (~used)
+        if not m.any():
+            continue
+        used |= m
+        cr, cg, cb = palette[idx % len(palette)]
+        col = np.array([cr, cg, cb], dtype=np.float32)
+        out[m] = (out[m].astype(np.float32) * (1.0 - alpha) + col * alpha).astype(np.uint8)
+
+    REGION_REGIONS_DIR.mkdir(parents=True, exist_ok=True)
+    REGION_REGIONS_CURRENT_DIR.mkdir(parents=True, exist_ok=True)
+
+    hist_png = REGION_REGIONS_DIR / f"{base_name}_regions.png"
+    current_png = REGION_REGIONS_CURRENT_DIR / "regions_current.png"
+    Image.fromarray(out).save(hist_png)
+    Image.fromarray(out).save(current_png)
+
+    regions_json_path = REGION_REGIONS_CURRENT_DIR / "regions_current.json"
+    payload = {
+        "image": str(image_path),
+        "regions_current_png": str(current_png),
+        "params": {"step": int(step), "tol_rgb": int(tol), "max_regions": int(RG_REGIONS_MAX), "min_area": int(RG_MIN_REGION_AREA)},
+        "regions": regions_out,
+    }
+    with regions_json_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
 def annotate_regions_and_save(image_path: str, results: List[dict]) -> None:
     """
     Domyślna wizualizacja regionów tła na podstawie bg_cluster_id.
