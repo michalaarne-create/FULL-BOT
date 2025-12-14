@@ -1688,144 +1688,20 @@ def annotate_regions_floodfill_and_save_from_mask(image_path: str, img_rgb: np.n
 
 def annotate_regions_and_save(image_path: str, results: List[dict]) -> None:
     """
-    Domyślna wizualizacja regionów tła na podstawie bg_cluster_id.
+    Generuje regiony tła floodfillem (bez boxów) z ignorowaniem maski tekstu.
 
-    - Korzysta z pól `bg_cluster_id` i `text_box`/`dropdown_box` w wynikach OCR.
-    - Dla każdego klastra rysuje duży prostokąt obejmujący wszystkie jego boxy.
-    - Zapisuje:
-        * historyczny plik w `REGION_REGIONS_DIR`,
-        * aktualny w `REGION_REGIONS_CURRENT_DIR/regions_current.png`.
+    Zapisuje obok siebie:
+    - `REGION_REGIONS_CURRENT_DIR/regions_current.png`
+    - `REGION_REGIONS_CURRENT_DIR/regions_current.json`
+
+    Regiony < `RG_MIN_REGION_AREA` są odrzucane.
+    Brak GPU / błąd GPU => wyjątek (bez CPU fallback).
     """
-    try:
-        img = Image.open(image_path).convert("RGB")
-    except Exception as exc:
-        print(f"[WARN REGIONS] Could not open image for regions: {exc}")
-        return
-
-    W, H = img.size
-
-    clusters: Dict[int, Dict[str, int]] = {}
-    for r in results or []:
-        cid = r.get("bg_cluster_id")
-        if cid is None:
-            continue
-        try:
-            cid_int = int(cid)
-        except Exception:
-            continue
-        box = r.get("dropdown_box") or r.get("text_box")
-        if not box or len(box) != 4:
-            continue
-        try:
-            x1, y1, x2, y2 = [int(v) for v in box]
-        except Exception:
-            continue
-        x1 = clamp(x1, 0, W - 1)
-        y1 = clamp(y1, 0, H - 1)
-        x2 = clamp(x2, 1, W)
-        y2 = clamp(y2, 1, H)
-        if x2 <= x1 or y2 <= y1:
-            continue
-        c = clusters.get(cid_int)
-        if c is None:
-            clusters[cid_int] = {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
-        else:
-            c["x1"] = min(c["x1"], x1)
-            c["y1"] = min(c["y1"], y1)
-            c["x2"] = max(c["x2"], x2)
-            c["y2"] = max(c["y2"], y2)
-
-    if not clusters:
-        # Zapisz pusty JSON, żeby UI/brain zawsze miały artefakt do odczytu.
-        try:
-            REGION_REGIONS_CURRENT_DIR.mkdir(parents=True, exist_ok=True)
-            regions_json_path = REGION_REGIONS_CURRENT_DIR / "regions_current.json"
-            payload = {
-                "image": str(image_path),
-                "regions_current_png": str(REGION_REGIONS_CURRENT_DIR / "regions_current.png"),
-                "image_size": {"w": int(W), "h": int(H)},
-                "clusters": [],
-                "reason": "no_bg_cluster_id",
-            }
-            with regions_json_path.open("w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-        print("[DEBUG REGIONS] No bg_cluster_id metadata; skipping regions overlay.")
-        return
-
-    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-
-    palette = [
-        (255, 0, 0),
-        (0, 128, 255),
-        (0, 200, 0),
-        (255, 165, 0),
-        (180, 0, 255),
-        (255, 0, 180),
-        (0, 255, 200),
-    ]
-
-    for idx, (cid, box) in enumerate(sorted(clusters.items())):
-        r, g, b = palette[idx % len(palette)]
-        fill = (r, g, b, 70)
-        edge = (r, g, b, 220)
-        x1, y1, x2, y2 = box["x1"], box["y1"], box["x2"], box["y2"]
-        draw.rectangle((x1, y1, x2, y2), fill=fill, outline=edge, width=3)
-
-    out = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
-
-    try:
-        REGION_REGIONS_DIR.mkdir(parents=True, exist_ok=True)
-        REGION_REGIONS_CURRENT_DIR.mkdir(parents=True, exist_ok=True)
-        base_name = os.path.splitext(os.path.basename(image_path))[0]
-        hist_path = REGION_REGIONS_DIR / f"{base_name}_regions.png"
-        current_path = REGION_REGIONS_CURRENT_DIR / "regions_current.png"
-        out.save(hist_path)
-        out.save(current_path)
-        print(f"[DEBUG REGIONS] Saved regions: hist={hist_path} current={current_path}")
-
-        # Tekstowa reprezentacja `regions_current.png`
-        try:
-            counts: Dict[int, int] = {}
-            for r in results or []:
-                cid = r.get("bg_cluster_id")
-                try:
-                    cid_int = int(cid) if cid is not None else None
-                except Exception:
-                    cid_int = None
-                if cid_int is None:
-                    continue
-                counts[cid_int] = counts.get(cid_int, 0) + 1
-
-            clusters_out = []
-            for idx, (cid, box) in enumerate(sorted(clusters.items())):
-                cr, cg, cb = palette[idx % len(palette)]
-                clusters_out.append(
-                    {
-                        "cluster_id": int(cid),
-                        "bbox_xyxy": [int(box["x1"]), int(box["y1"]), int(box["x2"]), int(box["y2"])],
-                        "color_rgb": [int(cr), int(cg), int(cb)],
-                        "fill_rgba": [int(cr), int(cg), int(cb), 70],
-                        "outline_rgba": [int(cr), int(cg), int(cb), 220],
-                        "items_count": int(counts.get(int(cid), 0)),
-                    }
-                )
-
-            regions_json_path = REGION_REGIONS_CURRENT_DIR / "regions_current.json"
-            payload = {
-                "image": str(image_path),
-                "regions_current_png": str(current_path),
-                "image_size": {"w": int(W), "h": int(H)},
-                "clusters": clusters_out,
-            }
-            with regions_json_path.open("w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-        except Exception as exc_json:
-            print(f"[WARN REGIONS] Failed to save regions_current.json: {exc_json}")
-    except Exception as exc:
-        print(f"[WARN REGIONS] Failed to save regions overlays: {exc}")
+    img_pil = Image.open(image_path).convert("RGB")
+    img_np = np.ascontiguousarray(np.array(img_pil, dtype=np.uint8))
+    H, W = img_np.shape[:2]
+    text_mask = _build_text_mask_from_results(W, H, results)
+    annotate_regions_floodfill_and_save_from_mask(image_path, img_np, text_mask)
 
 def _extract_roi_patch(img_rgb: np.ndarray, seed_y: int, seed_x: int, radius: int):
     H, W = img_rgb.shape[:2]
@@ -2438,12 +2314,46 @@ def run_dropdown_detection(image_path: str) -> dict:
 
     max_workers = min(max(1, os.cpu_count() or 2), 8)
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        # Regiony tła równolegle do per-box processingu (GPU-only; błąd ma przerwać pipeline).
+        regions_future = ex.submit(annotate_regions_floodfill_and_save_from_mask, image_path, img, text_mask)
+
         futures = [ex.submit(_process_detection, idx, quad, txt, conf) for idx, (quad, txt, conf) in enumerate(ocr_raw)]
         for fut in as_completed(futures):
             i, res = fut.result()
             results.append((i, res))
 
+        # Poczekaj na regiony – wyjątek ma przerwać pipeline zgodnie z wymaganiami (brak CPU fallback).
+        regions_future.result()
+
     results = [r for _, r in sorted(results, key=lambda x: x[0])]
+
+    # Odrzuć małe boxy z głównego region_grow (text_box / dropdown_box) – ważne dla spójności pipeline.
+    try:
+        min_box_area = int(RG_MIN_BOX_AREA)
+    except Exception:
+        min_box_area = 50000
+
+    if min_box_area > 0 and results:
+        kept: List[dict] = []
+        dropped = 0
+        for r in results:
+            box = r.get("dropdown_box") or r.get("text_box")
+            if not box or len(box) != 4:
+                kept.append(r)
+                continue
+            try:
+                x1, y1, x2, y2 = [int(v) for v in box]
+            except Exception:
+                kept.append(r)
+                continue
+            area = max(0, x2 - x1) * max(0, y2 - y1)
+            if area < min_box_area:
+                dropped += 1
+                continue
+            kept.append(r)
+        if dropped:
+            print(f"[DEBUG] Dropped {dropped} boxes below min area {min_box_area}px^2")
+        results = kept
 
     print(f"[DEBUG] Collected {len(results)} results")
     timer.mark("Process detections")
